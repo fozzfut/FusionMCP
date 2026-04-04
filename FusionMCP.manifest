@@ -1,0 +1,8 @@
+{
+    "autodeskProduct": "Fusion",
+    "type": "addin",
+    "author": "imran",
+    "description": "HTTP bridge add-in for Fusion 360 MCP integration",
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
