@@ -32,6 +32,12 @@ _lock = threading.Lock()
 CUSTOM_EVENT_ID = "FusionMCPTickV4"
 PORT = 7432
 
+# Security note: exec() runs on localhost only. For optional authentication,
+# set the FUSION_MCP_TOKEN environment variable.
+_auth_token = None  # Set via environment variable FUSION_MCP_TOKEN for optional auth
+
+_processing = False  # Re-entrance guard for notify()
+
 SLOW_COMMANDS = {"export_stl", "export_step", "export_3mf", "export_f3d", "execute_script", "capture_screenshot"}
 
 
@@ -63,15 +69,20 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
         cmd = data.get("command", "")
         timeout = 120 if cmd in SLOW_COMMANDS else 30
         event = threading.Event()
+        # Register the result event BEFORE enqueuing so the handler always
+        # finds it.  fireCustomEvent is just a wake-up hint and is safe
+        # outside the lock.
         with _lock:
             _result_events[cmd_id] = event
         _cmd_queue.put(data)
         if app:
             app.fireCustomEvent(CUSTOM_EVENT_ID, cmd_id)
-        event.wait(timeout=timeout)
+        timed_out = not event.wait(timeout=timeout)
         with _lock:
-            result = _results.pop(cmd_id, {"error": f"Timeout - Fusion did not respond in {timeout}s"})
+            result = _results.pop(cmd_id, None)
             _result_events.pop(cmd_id, None)
+        if result is None:
+            return {"error": f"Timeout - Fusion did not respond in {timeout}s"}
         return result
 
     def _respond(self, code: int, body: dict):
@@ -249,8 +260,10 @@ def _timeline_group(label="MCP Operation"):
     except Exception:
         # Rollback: delete timeline entries created during this block
         try:
-            current = tl.count
-            while tl.count > start_pos:
+            max_rollback = tl.count - start_pos
+            for _ in range(max_rollback):
+                if tl.count <= start_pos:
+                    break
                 item = tl.item(tl.count - 1)
                 item.entity.deleteMe()
         except Exception:
@@ -313,7 +326,7 @@ def _get_face_info(root, p):
         try:
             n = f.geometry.normal
             normal = [round(n.x, 3), round(n.y, 3), round(n.z, 3)]
-        except:
+        except Exception:
             normal = None
         faces.append({"index": i, "area_cm2": round(f.area, 4),
                        "type": geo_type, "normal": normal})
@@ -380,7 +393,7 @@ def _measure_body(root, p):
     try:
         props = body.physicalProperties
         vol = round(props.volume, 6)
-    except:
+    except Exception:
         pass
     return {
         "body": body.name,
@@ -424,6 +437,8 @@ def _measure_between(root, p):
 # ---- Execute Script ----
 
 def _execute_script(p):
+    if _auth_token and p.get("token") != _auth_token:
+        return {"error": "Authentication required. Provide 'token' parameter."}
     code = p.get("code", "")
     if not code.strip():
         return {"error": "No code provided"}
@@ -440,8 +455,9 @@ def _execute_script(p):
         exec(code, {"__builtins__": __builtins__}, local_vars)
         output = local_vars.get("result", result).get("output", None)
         return {"success": True, "output": output}
-    except Exception:
-        return {"error": traceback.format_exc()}
+    except Exception as e:
+        traceback.print_exc()
+        return {"error": str(e)}
 
 
 # ---- Document Management ----
@@ -458,17 +474,17 @@ def _clear_design():
     for i in range(timeline.count - 1, -1, -1):
         try:
             timeline.item(i).entity.deleteMe()
-        except:
+        except Exception:
             pass
     while root.sketches.count > 0:
         try:
             root.sketches.item(0).deleteMe()
-        except:
+        except Exception:
             break
     while root.constructionPlanes.count > 0:
         try:
             root.constructionPlanes.item(0).deleteMe()
-        except:
+        except Exception:
             break
     return {"cleared": True}
 
@@ -948,7 +964,7 @@ def _create_pipe(root, p):
             try:
                 if f.geometry.normal:
                     end_faces.append((f.area, f))
-            except:
+            except Exception:
                 pass
         if len(end_faces) >= 2:
             end_faces.sort(key=lambda x: x[0])
@@ -1430,7 +1446,7 @@ def _list_appearances(p):
                 for j in range(min(lib.appearances.count, 30)):
                     a = lib.appearances.item(j)
                     results.append({"name": a.name, "library": lib.name})
-            except:
+            except Exception:
                 pass
     except Exception as e:
         return {"error": str(e)}
@@ -1451,7 +1467,7 @@ def _apply_appearance(root, p):
                     if search in a.name.lower():
                         body.appearance = a
                         return {"applied": a.name, "to": body.name}
-            except:
+            except Exception:
                 pass
         return {"error": f"No appearance matching '{search}' found."}
     except Exception as e:
@@ -1475,7 +1491,7 @@ def _set_body_color(root, p):
                 try:
                     if isinstance(prop.value, adsk.core.Color):
                         prop.value = adsk.core.Color.create(r, g, b_val, opacity)
-                except:
+                except Exception:
                     pass
         body.appearance = custom
         return {"color_set": body.name, "rgb": f"({r},{g},{b_val})", "opacity": opacity}
@@ -1568,12 +1584,12 @@ def _save_as(p):
 
 # ---- Component/Occurrence Management ----
 
-def _rename_component(p):
+def _rename_component(root, p):
     name = p.get("component", "")
     new_name = p.get("name", "")
     if not new_name:
         raise Exception("Parameter 'name' is required.")
-    comp = _find_component(_root(), name)
+    comp = _find_component(root, name)
     old = comp.name
     comp.name = new_name
     return {"renamed": old, "new_name": new_name}
@@ -1702,7 +1718,7 @@ def _process_command(data: dict) -> dict:
             "move_body_to_component":     lambda: _move_body_to_component(root, p),
             "create_joint":               lambda: _create_joint(root, p),
             "create_as_built_joint":      lambda: _create_as_built_joint(root, p),
-            "rename_component":           lambda: _rename_component(p),
+            "rename_component":           lambda: _rename_component(root, p),
             "delete_occurrence":          lambda: _delete_occurrence(root, p),
             "toggle_component_visibility": lambda: _toggle_component_visibility(root, p),
             "list_occurrences_tree":      lambda: _list_occurrences_tree(root),
@@ -1731,6 +1747,7 @@ def _process_command(data: dict) -> dict:
             "redo":                       lambda: _redo(p),
             "save":                       lambda: _save_design(p),
             "save_as":                    lambda: _save_as(p),
+            "fusion_status":              lambda: {"status": "ok", "message": "Fusion MCP bridge running"},
             "export_obj":                 lambda: {"error": "OBJ export is not supported by the Fusion 360 API. Use STL, STEP, or 3MF instead."},
         }
 
@@ -1741,8 +1758,10 @@ def _process_command(data: dict) -> dict:
                 return dispatch[cmd]()
         return {"error": f"Unknown command '{cmd}'",
                 "available_commands": sorted(dispatch.keys())}
-    except Exception:
-        return {"error": traceback.format_exc()}
+    except Exception as e:
+        # Log the full traceback internally but only return a summary to the client
+        traceback.print_exc()
+        return {"error": str(e)}
 
 
 # ---- Event Handler ----
@@ -1752,9 +1771,16 @@ class MCPEventHandler(adsk.core.CustomEventHandler):
         super().__init__()
 
     def notify(self, args):
+        global _processing
+        if _processing:
+            return
+        _processing = True
         try:
-            while not _cmd_queue.empty():
-                data = _cmd_queue.get_nowait()
+            while True:
+                try:
+                    data = _cmd_queue.get_nowait()
+                except queue.Empty:
+                    break
                 cmd_id = data.get("id")
                 result = _process_command(data)
                 with _lock:
@@ -1764,15 +1790,18 @@ class MCPEventHandler(adsk.core.CustomEventHandler):
         except Exception:
             import traceback
             traceback.print_exc()
+        finally:
+            _processing = False
 
 
 # ---- Add-in Lifecycle ----
 
 def run(context):
-    global app, ui, _server, _server_thread
+    global app, ui, _server, _server_thread, _auth_token
     try:
         app = adsk.core.Application.get()
         ui = app.userInterface
+        _auth_token = os.environ.get("FUSION_MCP_TOKEN", None)
         custom_event = app.registerCustomEvent(CUSTOM_EVENT_ID)
         handler = MCPEventHandler()
         custom_event.add(handler)
@@ -1790,13 +1819,18 @@ def run(context):
 
 
 def stop(context):
-    global _server
+    global _server, _server_thread
     try:
         if _server:
             _server.shutdown()
+        if _server_thread:
+            _server_thread.join(timeout=5)
+            _server_thread = None
+        _server = None
         app.unregisterCustomEvent(CUSTOM_EVENT_ID)
-        for h in _handlers:
-            del h
         _handlers.clear()
+        with _lock:
+            _results.clear()
+            _result_events.clear()
     except Exception:
         pass
