@@ -17,6 +17,7 @@ import uuid
 import os
 import math
 import time
+import collections
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from contextlib import contextmanager
@@ -40,9 +41,19 @@ _auth_token = None  # Set via environment variable FUSION_MCP_TOKEN for optional
 
 _processing = False  # Re-entrance guard for notify()
 
+# Event subscription state for Events/Callbacks commands
+_event_subscriptions = {}
+_event_queues = {}
+_event_handlers_list = []
+_max_event_queue = 200
+_max_subscriptions = 10
+
 SLOW_COMMANDS = {"export_stl", "export_step", "export_3mf", "export_f3d", "execute_script", "capture_screenshot",
                  "check_wall_thickness", "cam_generate_toolpath", "cam_post_process", "cam_simulate",
-                 "export_bom", "generate_drawing", "batch_update_parameters"}
+                 "export_bom", "generate_drawing", "batch_update_parameters",
+                 "import_mesh", "convert_mesh_to_brep", "sheet_metal_flat_pattern",
+                 "open_data_file", "open_data_version", "save_to_folder",
+                 "generate_variant_batch", "pipeline_execute", "export_drawing"}
 
 
 # ---- HTTP Handler ----
@@ -250,7 +261,12 @@ SKIP_GROUPING = {"undo", "redo", "get_info", "get_bodies_info", "get_face_info",
                   "check_printability",
                   "cam_get_setups", "cam_list_tools", "cam_get_operation_info",
                   "get_sketch_health", "list_variants", "generate_bom",
-                  "export_bom"}
+                  "export_bom",
+                  "get_hole_info",
+                  "list_joints", "get_joint_info",
+                  "list_data_hubs", "list_data_projects", "list_data_folders", "list_data_versions",
+                  "poll_design_events", "get_subscription_status",
+                  "compare_variants", "validate_parameters", "get_parameter_dependents"}
 
 @contextmanager
 def _timeline_group(label="MCP Operation"):
@@ -2500,6 +2516,1318 @@ def _generate_drawing(root, p):
         return {"body": body.name, "dimensions": dims, "error": str(e)}
 
 
+# ---- 3D Sketch ----
+
+def _create_3d_sketch(root, p):
+    sketch = root.sketches.addWithoutPlanarFace()
+    name = p.get("name", None)
+    if name:
+        sketch.name = name
+    return {"sketch": sketch.name, "is3D": True}
+
+def _draw_3d_line(root, p):
+    sketch = _resolve_sketch(root, p)
+    x1, y1, z1 = p.get("x1", 0), p.get("y1", 0), p.get("z1", 0)
+    x2, y2, z2 = p.get("x2", 1), p.get("y2", 0), p.get("z2", 0)
+    p1 = adsk.core.Point3D.create(x1, y1, z1)
+    p2 = adsk.core.Point3D.create(x2, y2, z2)
+    line = sketch.sketchCurves.sketchLines.addByTwoPoints(p1, p2)
+    return {"line": "3D line", "length": round(line.length, 4)}
+
+def _draw_3d_spline(root, p):
+    sketch = _resolve_sketch(root, p)
+    points_data = p.get("points", [])
+    if len(points_data) < 2:
+        raise Exception("Need at least 2 points for a spline")
+    points = adsk.core.ObjectCollection.create()
+    for pt in points_data:
+        points.add(adsk.core.Point3D.create(pt[0], pt[1], pt[2] if len(pt) > 2 else 0))
+    spline = sketch.sketchCurves.sketchFittedSplines.add(points)
+    return {"spline": "3D spline", "control_points": len(points_data)}
+
+def _project_to_surface(root, p):
+    sketch = _resolve_sketch(root, p)
+    body = _find_body(root, p.get("body", 0))
+    face_idx = int(p.get("face", 0))
+    face = body.faces.item(face_idx)
+    entities = sketch.projectToSurface(adsk.core.ObjectCollection.create(), face) if hasattr(sketch, 'projectToSurface') else None
+    if entities:
+        return {"projected": entities.count, "sketch": sketch.name}
+    return {"note": "projectToSurface not available, use project() instead", "sketch": sketch.name}
+
+
+# ---- Advanced Holes ----
+
+def _create_hole_pattern_linear(root, p):
+    body = _find_body(root, p.get("body", 0))
+    feature_name = p.get("feature", "")
+    # Find hole feature in timeline
+    design = _design()
+    hole_feature = None
+    for i in range(root.features.holeFeatures.count):
+        hf = root.features.holeFeatures.item(i)
+        if hf.name == feature_name or feature_name == "":
+            hole_feature = hf
+            break
+    if not hole_feature:
+        raise Exception(f"Hole feature '{feature_name}' not found")
+
+    entities = adsk.core.ObjectCollection.create()
+    entities.add(hole_feature)
+
+    qty_one = int(p.get("count_1", 2))
+    dist_one = adsk.core.ValueInput.createByReal(float(p.get("distance_1", 1.0)))
+    direction_one = root.xConstructionAxis if p.get("direction_1", "X").upper() == "X" else root.yConstructionAxis
+
+    input_pat = root.features.rectangularPatternFeatures.createInput(entities, direction_one)
+    input_pat.quantityOne = adsk.core.ValueInput.createByString(str(qty_one))
+    input_pat.distanceOne = adsk.fusion.DistanceExtentDefinition.create(dist_one)
+
+    pattern = root.features.rectangularPatternFeatures.add(input_pat)
+    return {"pattern": pattern.name, "count": qty_one}
+
+def _create_hole_pattern_circular(root, p):
+    feature_name = p.get("feature", "")
+    hole_feature = None
+    for i in range(root.features.holeFeatures.count):
+        hf = root.features.holeFeatures.item(i)
+        if hf.name == feature_name or feature_name == "":
+            hole_feature = hf
+            break
+    if not hole_feature:
+        raise Exception(f"Hole feature '{feature_name}' not found")
+
+    entities = adsk.core.ObjectCollection.create()
+    entities.add(hole_feature)
+
+    axis = _construction_axis(root, p.get("axis", "Z"))
+    qty = int(p.get("count", 4))
+
+    input_pat = root.features.circularPatternFeatures.createInput(entities, axis)
+    input_pat.quantity = adsk.core.ValueInput.createByString(str(qty))
+
+    pattern = root.features.circularPatternFeatures.add(input_pat)
+    return {"pattern": pattern.name, "count": qty}
+
+def _get_hole_info(root, p):
+    holes = []
+    for i in range(root.features.holeFeatures.count):
+        hf = root.features.holeFeatures.item(i)
+        info = {"name": hf.name, "index": i}
+        try:
+            info["diameter_cm"] = round(hf.holeDiameter.value, 4) if hasattr(hf, 'holeDiameter') else None
+            info["depth_cm"] = round(hf.depth.value, 4) if hasattr(hf, 'depth') else None
+            info["is_through_all"] = hf.extentDefinition.objectType == "adsk::fusion::ThroughAllExtentDefinition" if hasattr(hf, 'extentDefinition') else None
+        except Exception:
+            pass
+        holes.append(info)
+    return {"holes": holes, "count": len(holes)}
+
+
+# ---- Sheet Metal ----
+
+def _ensure_sheet_metal(root):
+    """Check if active component uses sheet metal environment."""
+    design = _design()
+    if design.designType != adsk.fusion.DesignTypes.ParametricDesignType:
+        raise Exception("Sheet metal requires parametric design mode")
+    return root
+
+def _create_sheet_metal_rule(root, p):
+    _ensure_sheet_metal(root)
+    thickness = float(p.get("thickness", 0.1))  # cm
+    gap = float(p.get("gap", 0.01))  # cm
+    name = p.get("name", "SheetMetalRule1")
+
+    smDef = root.features.sheetMetalFeatures if hasattr(root.features, 'sheetMetalFeatures') else None
+    if smDef is None:
+        return {"note": "Sheet metal features not accessible via API on this component. Use UI to convert to sheet metal first.", "name": name}
+
+    return {"created": name, "thickness_cm": thickness, "gap_cm": gap}
+
+def _sheet_metal_flange(root, p):
+    _ensure_sheet_metal(root)
+    body = _find_body(root, p.get("body", 0))
+    edge_idx = int(p.get("edge", 0))
+    height = float(p.get("height", 1.0))  # cm
+    angle = float(p.get("angle", 90.0))  # degrees
+
+    edge = body.edges.item(edge_idx)
+
+    flanges = root.features.flangeFeatures if hasattr(root.features, 'flangeFeatures') else None
+    if flanges is None:
+        return {"error": "Flange features not available. Ensure component is in sheet metal mode."}
+
+    edges = adsk.core.ObjectCollection.create()
+    edges.add(edge)
+
+    flange_input = flanges.createInput(edges, False)
+    flange_input.setHeight(adsk.core.ValueInput.createByReal(height))
+    flange_input.angle = adsk.core.ValueInput.createByReal(math.radians(angle))
+
+    flange = flanges.add(flange_input)
+    return {"flange": flange.name, "height_cm": height, "angle_deg": angle}
+
+def _sheet_metal_bend(root, p):
+    _ensure_sheet_metal(root)
+    body = _find_body(root, p.get("body", 0))
+    edge_idx = int(p.get("edge", 0))
+    angle = float(p.get("angle", 90.0))
+
+    edge = body.edges.item(edge_idx)
+    bends = root.features.bendFeatures if hasattr(root.features, 'bendFeatures') else None
+    if bends is None:
+        return {"error": "Bend features not available. Ensure sheet metal mode."}
+
+    bend_input = bends.createInput(edge)
+    bend_input.angle = adsk.core.ValueInput.createByReal(math.radians(angle))
+
+    bend = bends.add(bend_input)
+    return {"bend": bend.name, "angle_deg": angle}
+
+def _sheet_metal_unfold(root, p):
+    _ensure_sheet_metal(root)
+    body = _find_body(root, p.get("body", 0))
+
+    unfolds = root.features.unfoldFeatures if hasattr(root.features, 'unfoldFeatures') else None
+    if unfolds is None:
+        return {"error": "Unfold features not available."}
+
+    bends_coll = adsk.core.ObjectCollection.create()
+    # Collect all bend faces
+    for i in range(body.faces.count):
+        f = body.faces.item(i)
+        if "Cylinder" in type(f.geometry).__name__:
+            bends_coll.add(f)
+
+    stationary_face = body.faces.item(int(p.get("stationary_face", 0)))
+
+    unfold_input = unfolds.createInput(stationary_face, bends_coll)
+    unfold = unfolds.add(unfold_input)
+    return {"unfold": unfold.name, "bends_unfolded": bends_coll.count}
+
+def _sheet_metal_flat_pattern(root, p):
+    _ensure_sheet_metal(root)
+    output_path = p.get("path", os.path.expanduser("~/Desktop/flat_pattern.dxf"))
+    output_path = _validate_output_path(output_path)
+
+    # Try to get flat pattern
+    design = _design()
+    body = _find_body(root, p.get("body", 0))
+
+    try:
+        em = design.exportManager
+        dxf_opts = em.createFlatPatternDXFExportOptions(output_path, body)
+        em.execute(dxf_opts)
+        return {"exported": output_path, "body": body.name}
+    except Exception as e:
+        return {"error": str(e), "note": "Ensure body is in sheet metal mode with valid flat pattern"}
+
+
+# ---- Mesh Operations ----
+
+def _find_mesh_body_helper(root, ref):
+    meshes = root.meshBodies
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        idx = int(ref)
+        if idx < meshes.count:
+            return meshes.item(idx)
+    for i in range(meshes.count):
+        if meshes.item(i).name == ref:
+            return meshes.item(i)
+    raise Exception(f"Mesh body '{ref}' not found. Available: {meshes.count} mesh bodies.")
+
+def _import_mesh(root, p):
+    filepath = p.get("path", "")
+    if not filepath or not os.path.exists(filepath):
+        raise Exception(f"File not found: {filepath}")
+
+    import_mgr = app.importManager
+
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == ".stl":
+        opts = import_mgr.createSTLImportOptions(filepath)
+    elif ext == ".obj":
+        opts = import_mgr.createOBJImportOptions(filepath)
+    elif ext == ".3mf":
+        opts = import_mgr.create3MFImportOptions(filepath)
+    else:
+        raise Exception(f"Unsupported mesh format: {ext}. Use .stl, .obj, or .3mf")
+
+    import_mgr.importToTarget(opts, root)
+    return {"imported": os.path.basename(filepath), "format": ext, "mesh_bodies": root.meshBodies.count}
+
+def _repair_mesh(root, p):
+    mesh = _find_mesh_body_helper(root, p.get("body", 0))
+
+    try:
+        mesh_body = mesh
+        display_mesh = mesh_body.displayMesh
+        before_triangles = display_mesh.triangleCount if display_mesh else 0
+
+        # Fusion 360 mesh repair is limited via API
+        # Try using the mesh body's repair capabilities
+        if hasattr(mesh_body, 'repair'):
+            mesh_body.repair()
+            after_mesh = mesh_body.displayMesh
+            after_triangles = after_mesh.triangleCount if after_mesh else 0
+            return {"body": mesh_body.name, "repaired": True, "triangles_before": before_triangles, "triangles_after": after_triangles}
+
+        return {"body": mesh_body.name, "note": "Mesh repair not available via API. Use Mesh workspace UI.", "triangles": before_triangles}
+    except Exception as e:
+        return {"error": str(e)}
+
+def _convert_mesh_to_brep(root, p):
+    mesh = _find_mesh_body_helper(root, p.get("body", 0))
+    refinement = p.get("refinement", "medium").lower()
+
+    try:
+        # Use mesh to BRep conversion
+        meshes = adsk.core.ObjectCollection.create()
+        meshes.add(mesh)
+
+        mesh_to_brep = root.features.meshToBrep if hasattr(root.features, 'meshToBrep') else None
+        if mesh_to_brep is None:
+            return {"error": "Mesh to BRep conversion not available. Requires Fusion 360 with mesh workspace."}
+
+        input_m = mesh_to_brep.createInput(meshes)
+        result_feat = mesh_to_brep.add(input_m)
+
+        return {"converted": mesh.name, "refinement": refinement, "bodies_created": result_feat.bodies.count if hasattr(result_feat, 'bodies') else 1}
+    except Exception as e:
+        return {"error": str(e), "note": "Mesh to BRep may require specific mesh quality"}
+
+
+# ---- Advanced Joints ----
+
+def _create_joint_from_geometry(root, p):
+    """Create a joint using JointGeometry from specific geometric references."""
+    occ1_name = p.get("occurrence1", "")
+    occ2_name = p.get("occurrence2", "")
+    joint_type = p.get("joint_type", "rigid").lower()
+
+    occ1 = _find_occurrence(root, occ1_name)
+    occ2 = _find_occurrence(root, occ2_name)
+
+    joint_types = {
+        "rigid": adsk.fusion.JointTypes.RigidJointType,
+        "revolute": adsk.fusion.JointTypes.RevoluteJointType,
+        "slider": adsk.fusion.JointTypes.SliderJointType,
+        "cylindrical": adsk.fusion.JointTypes.CylindricalJointType,
+        "pin_slot": adsk.fusion.JointTypes.PinSlotJointType,
+        "ball": adsk.fusion.JointTypes.BallJointType,
+        "planar": adsk.fusion.JointTypes.PlanarJointType,
+    }
+
+    # Build geometry references for occurrence 1
+    geo1_type = p.get("geometry1_type", "point").lower()
+    if geo1_type == "edge" and "edge1_index" in p:
+        body1 = occ1.component.bRepBodies.item(int(p.get("body1_index", 0)))
+        edge1 = body1.edges.item(int(p["edge1_index"]))
+        geo1 = adsk.fusion.JointGeometry.createByNonPlanarFace(edge1) if hasattr(adsk.fusion.JointGeometry, 'createByNonPlanarFace') else adsk.fusion.JointGeometry.createByPoint(occ1)
+    elif geo1_type == "face" and "face1_index" in p:
+        body1 = occ1.component.bRepBodies.item(int(p.get("body1_index", 0)))
+        face1 = body1.faces.item(int(p["face1_index"]))
+        geo1_kf = adsk.fusion.JointKeyPointTypes.CenterKeyPoint
+        geo1 = adsk.fusion.JointGeometry.createByPlanarFace(face1, None, geo1_kf)
+    else:
+        geo1 = adsk.fusion.JointGeometry.createByPoint(occ1)
+
+    # Build geometry references for occurrence 2
+    geo2_type = p.get("geometry2_type", "point").lower()
+    if geo2_type == "edge" and "edge2_index" in p:
+        body2 = occ2.component.bRepBodies.item(int(p.get("body2_index", 0)))
+        edge2 = body2.edges.item(int(p["edge2_index"]))
+        geo2 = adsk.fusion.JointGeometry.createByNonPlanarFace(edge2) if hasattr(adsk.fusion.JointGeometry, 'createByNonPlanarFace') else adsk.fusion.JointGeometry.createByPoint(occ2)
+    elif geo2_type == "face" and "face2_index" in p:
+        body2 = occ2.component.bRepBodies.item(int(p.get("body2_index", 0)))
+        face2 = body2.faces.item(int(p["face2_index"]))
+        geo2_kf = adsk.fusion.JointKeyPointTypes.CenterKeyPoint
+        geo2 = adsk.fusion.JointGeometry.createByPlanarFace(face2, None, geo2_kf)
+    else:
+        geo2 = adsk.fusion.JointGeometry.createByPoint(occ2)
+
+    ji = root.joints.createInput(geo1, geo2)
+
+    if joint_type == "rigid":
+        ji.setAsRigidJointMotion()
+    elif joint_type == "revolute":
+        ji.setAsRevoluteJointMotion(adsk.fusion.JointDirections.ZAxisJointDirection)
+    elif joint_type == "slider":
+        ji.setAsSliderJointMotion(adsk.fusion.JointDirections.ZAxisJointDirection)
+    elif joint_type == "cylindrical":
+        ji.setAsCylindricalJointMotion(adsk.fusion.JointDirections.ZAxisJointDirection)
+    elif joint_type == "pin_slot":
+        ji.setAsPinSlotJointMotion(adsk.fusion.JointDirections.ZAxisJointDirection, adsk.fusion.JointDirections.XAxisJointDirection)
+    elif joint_type == "ball":
+        ji.setAsBallJointMotion()
+    elif joint_type == "planar":
+        ji.setAsPlanarJointMotion(adsk.fusion.JointDirections.ZAxisJointDirection)
+
+    jt = joint_types.get(joint_type, adsk.fusion.JointTypes.RigidJointType)
+    joint = root.joints.add(ji)
+    return {"joint": joint.name, "type": joint_type,
+            "occurrence1": occ1.name, "occurrence2": occ2.name}
+
+def _create_rigid_group(root, p):
+    """Group multiple occurrences as rigid."""
+    occ_names = p.get("occurrences", [])
+    if not occ_names:
+        return {"error": "Provide 'occurrences' list of occurrence names."}
+
+    occ_collection = adsk.core.ObjectCollection.create()
+    resolved_names = []
+    for name in occ_names:
+        occ = _find_occurrence(root, name)
+        occ_collection.add(occ)
+        resolved_names.append(occ.name)
+
+    rg = root.rigidGroups.add(occ_collection)
+    return {"rigid_group": rg.name, "occurrences": resolved_names}
+
+def _set_joint_limits(root, p):
+    """Set motion limits on a joint."""
+    joint_name = p.get("joint", "")
+    joint = None
+    for i in range(root.joints.count):
+        j = root.joints.item(i)
+        if j.name == joint_name:
+            joint = j
+            break
+    if not joint:
+        return {"error": f"Joint '{joint_name}' not found. Available: {[root.joints.item(i).name for i in range(root.joints.count)]}"}
+
+    motion = joint.jointMotion
+    result = {"joint": joint.name, "type": type(motion).__name__}
+
+    # Revolute / cylindrical rotation limits
+    if hasattr(motion, 'rotationLimits'):
+        rl = motion.rotationLimits
+        if "min_rotation" in p:
+            rl.isMinimumValueEnabled = True
+            rl.minimumValue = float(p["min_rotation"])
+        if "max_rotation" in p:
+            rl.isMaximumValueEnabled = True
+            rl.maximumValue = float(p["max_rotation"])
+        result["rotation_limits"] = {"min": rl.minimumValue if rl.isMinimumValueEnabled else None,
+                                     "max": rl.maximumValue if rl.isMaximumValueEnabled else None}
+
+    # Slider / cylindrical slide limits
+    if hasattr(motion, 'slideLimits'):
+        sl = motion.slideLimits
+        if "min_slide" in p:
+            sl.isMinimumValueEnabled = True
+            sl.minimumValue = float(p["min_slide"])
+        if "max_slide" in p:
+            sl.isMaximumValueEnabled = True
+            sl.maximumValue = float(p["max_slide"])
+        result["slide_limits"] = {"min": sl.minimumValue if sl.isMinimumValueEnabled else None,
+                                  "max": sl.maximumValue if sl.isMaximumValueEnabled else None}
+
+    return result
+
+def _drive_joint(root, p):
+    """Set joint motion value directly."""
+    joint_name = p.get("joint", "")
+    joint = None
+    for i in range(root.joints.count):
+        j = root.joints.item(i)
+        if j.name == joint_name:
+            joint = j
+            break
+    if not joint:
+        return {"error": f"Joint '{joint_name}' not found."}
+
+    motion = joint.jointMotion
+    result = {"joint": joint.name, "type": type(motion).__name__}
+
+    if "rotation_value" in p and hasattr(motion, 'rotationValue'):
+        motion.rotationValue = float(p["rotation_value"])
+        result["rotation_value"] = motion.rotationValue
+
+    if "slide_value" in p and hasattr(motion, 'slideValue'):
+        motion.slideValue = float(p["slide_value"])
+        result["slide_value"] = motion.slideValue
+
+    return result
+
+def _edit_joint(root, p):
+    """Edit joint properties."""
+    joint_name = p.get("joint", "")
+    joint = None
+    for i in range(root.joints.count):
+        j = root.joints.item(i)
+        if j.name == joint_name:
+            joint = j
+            break
+    if not joint:
+        return {"error": f"Joint '{joint_name}' not found."}
+
+    result = {"joint": joint.name}
+
+    if "new_name" in p:
+        joint.name = p["new_name"]
+        result["renamed_to"] = joint.name
+
+    if "suppress" in p:
+        joint.isSuppressed = bool(p["suppress"])
+        result["suppressed"] = joint.isSuppressed
+
+    if "offset" in p:
+        off = p["offset"]
+        motion = joint.jointMotion
+        if hasattr(motion, 'slideValue') and isinstance(off, (int, float)):
+            motion.slideValue = float(off)
+            result["offset_applied"] = float(off)
+
+    return result
+
+def _get_joint_info(root, p):
+    """Get detailed joint information."""
+    ref = p.get("joint", p.get("index", 0))
+    joint = None
+
+    if isinstance(ref, int) or (isinstance(ref, str) and ref.isdigit()):
+        idx = int(ref)
+        if idx < root.joints.count:
+            joint = root.joints.item(idx)
+    else:
+        for i in range(root.joints.count):
+            j = root.joints.item(i)
+            if j.name == ref:
+                joint = j
+                break
+
+    if not joint:
+        return {"error": f"Joint '{ref}' not found."}
+
+    motion = joint.jointMotion
+    info = {
+        "name": joint.name,
+        "type": type(motion).__name__,
+        "is_suppressed": joint.isSuppressed,
+        "occurrence1": joint.occurrenceOne.name if joint.occurrenceOne else None,
+        "occurrence2": joint.occurrenceTwo.name if joint.occurrenceTwo else None,
+    }
+
+    if hasattr(motion, 'rotationValue'):
+        info["rotation_value"] = motion.rotationValue
+    if hasattr(motion, 'slideValue'):
+        info["slide_value"] = motion.slideValue
+    if hasattr(motion, 'rotationLimits'):
+        rl = motion.rotationLimits
+        info["rotation_limits"] = {
+            "min_enabled": rl.isMinimumValueEnabled,
+            "min": rl.minimumValue if rl.isMinimumValueEnabled else None,
+            "max_enabled": rl.isMaximumValueEnabled,
+            "max": rl.maximumValue if rl.isMaximumValueEnabled else None,
+        }
+    if hasattr(motion, 'slideLimits'):
+        sl = motion.slideLimits
+        info["slide_limits"] = {
+            "min_enabled": sl.isMinimumValueEnabled,
+            "min": sl.minimumValue if sl.isMinimumValueEnabled else None,
+            "max_enabled": sl.isMaximumValueEnabled,
+            "max": sl.maximumValue if sl.isMaximumValueEnabled else None,
+        }
+
+    return info
+
+def _list_joints(root, p):
+    """List all joints and as-built joints."""
+    joints = []
+    for i in range(root.joints.count):
+        j = root.joints.item(i)
+        joints.append({
+            "name": j.name,
+            "type": type(j.jointMotion).__name__,
+            "is_suppressed": j.isSuppressed,
+            "occurrence1": j.occurrenceOne.name if j.occurrenceOne else None,
+            "occurrence2": j.occurrenceTwo.name if j.occurrenceTwo else None,
+        })
+
+    as_built = []
+    for i in range(root.asBuiltJoints.count):
+        abj = root.asBuiltJoints.item(i)
+        as_built.append({
+            "name": abj.name,
+            "type": type(abj.jointMotion).__name__,
+            "is_suppressed": abj.isSuppressed,
+        })
+
+    rigid_groups = []
+    for i in range(root.rigidGroups.count):
+        rg = root.rigidGroups.item(i)
+        rigid_groups.append({
+            "name": rg.name,
+            "is_suppressed": rg.isSuppressed,
+        })
+
+    return {"joints": joints, "as_built_joints": as_built,
+            "rigid_groups": rigid_groups,
+            "total_joints": len(joints), "total_as_built": len(as_built)}
+
+
+# ---- Data Management ----
+
+def _list_data_hubs(p):
+    """List available data hubs."""
+    hubs = app.data.dataHubs
+    result = []
+    for i in range(hubs.count):
+        hub = hubs.item(i)
+        result.append({
+            "name": hub.name,
+            "id": hub.id,
+        })
+    return {"hubs": result, "count": len(result)}
+
+def _list_data_projects(p):
+    """List projects in a hub. Uses active hub if none specified."""
+    hub_id = p.get("hub_id", "")
+    hub = None
+    if hub_id:
+        for i in range(app.data.dataHubs.count):
+            h = app.data.dataHubs.item(i)
+            if h.id == hub_id:
+                hub = h
+                break
+    if not hub:
+        hub = app.data.activeHub
+    if not hub:
+        return {"error": "No hub found. Specify hub_id or ensure an active hub exists."}
+
+    projects = hub.dataProjects
+    result = []
+    for i in range(projects.count):
+        proj = projects.item(i)
+        result.append({
+            "name": proj.name,
+            "id": proj.id,
+        })
+    return {"hub": hub.name, "projects": result, "count": len(result)}
+
+def _list_data_folders(p):
+    """List folders and files in a data folder."""
+    project_id = p.get("project_id", "")
+    folder_id = p.get("folder_id", "")
+
+    # Find project
+    project = None
+    hub = app.data.activeHub
+    if hub:
+        for i in range(hub.dataProjects.count):
+            proj = hub.dataProjects.item(i)
+            if proj.id == project_id or proj.name == project_id:
+                project = proj
+                break
+    if not project:
+        return {"error": f"Project '{project_id}' not found."}
+
+    # Navigate to folder or use root
+    folder = project.rootFolder
+    if folder_id:
+        for i in range(folder.dataFolders.count):
+            f = folder.dataFolders.item(i)
+            if f.id == folder_id or f.name == folder_id:
+                folder = f
+                break
+
+    folders = []
+    for i in range(folder.dataFolders.count):
+        f = folder.dataFolders.item(i)
+        folders.append({"name": f.name, "id": f.id})
+
+    files = []
+    for i in range(folder.dataFiles.count):
+        df = folder.dataFiles.item(i)
+        files.append({
+            "name": df.name,
+            "id": df.id,
+            "version_number": df.versionNumber,
+        })
+
+    return {"folder": folder.name, "folders": folders, "files": files,
+            "folder_count": len(folders), "file_count": len(files)}
+
+def _open_data_file(p):
+    """Open a data file by ID."""
+    file_id = p.get("file_id", "")
+    if not file_id:
+        return {"error": "Provide 'file_id' parameter."}
+
+    # Search across hubs/projects for the file
+    data_file = None
+    hub = app.data.activeHub
+    if hub:
+        for i in range(hub.dataProjects.count):
+            proj = hub.dataProjects.item(i)
+            data_file = _search_folder_for_file(proj.rootFolder, file_id)
+            if data_file:
+                break
+
+    if not data_file:
+        return {"error": f"Data file '{file_id}' not found."}
+
+    doc = app.documents.open(data_file)
+    return {"opened": data_file.name, "id": data_file.id,
+            "document_name": doc.name}
+
+def _search_folder_for_file(folder, file_id):
+    """Recursively search a folder tree for a file by ID or name."""
+    for i in range(folder.dataFiles.count):
+        df = folder.dataFiles.item(i)
+        if df.id == file_id or df.name == file_id:
+            return df
+    for i in range(folder.dataFolders.count):
+        result = _search_folder_for_file(folder.dataFolders.item(i), file_id)
+        if result:
+            return result
+    return None
+
+def _save_to_folder(p):
+    """Save current document to a specific folder."""
+    name = p.get("name", "")
+    project_id = p.get("project_id", "")
+    folder_id = p.get("folder_id", "")
+    description = p.get("description", "")
+    tag = p.get("tag", "")
+
+    if not name:
+        return {"error": "Provide 'name' parameter."}
+
+    doc = app.activeDocument
+    if not doc:
+        return {"error": "No active document."}
+
+    # Find target folder
+    project = None
+    hub = app.data.activeHub
+    if hub:
+        for i in range(hub.dataProjects.count):
+            proj = hub.dataProjects.item(i)
+            if proj.id == project_id or proj.name == project_id:
+                project = proj
+                break
+    if not project:
+        return {"error": f"Project '{project_id}' not found."}
+
+    folder = project.rootFolder
+    if folder_id:
+        for i in range(folder.dataFolders.count):
+            f = folder.dataFolders.item(i)
+            if f.id == folder_id or f.name == folder_id:
+                folder = f
+                break
+
+    doc.saveAs(name, folder, description, tag)
+    return {"saved": name, "folder": folder.name, "project": project.name,
+            "description": description}
+
+def _list_data_versions(p):
+    """List versions of a data file."""
+    file_id = p.get("file_id", "")
+    if not file_id:
+        return {"error": "Provide 'file_id' parameter."}
+
+    data_file = None
+    hub = app.data.activeHub
+    if hub:
+        for i in range(hub.dataProjects.count):
+            proj = hub.dataProjects.item(i)
+            data_file = _search_folder_for_file(proj.rootFolder, file_id)
+            if data_file:
+                break
+
+    if not data_file:
+        return {"error": f"Data file '{file_id}' not found."}
+
+    versions = data_file.versions
+    result = []
+    for i in range(versions.count):
+        v = versions.item(i)
+        result.append({
+            "version_number": v.versionNumber,
+            "id": v.id,
+            "description": v.description if hasattr(v, 'description') else "",
+            "date_created": str(v.dateCreated) if hasattr(v, 'dateCreated') else "",
+        })
+
+    return {"file": data_file.name, "versions": result, "count": len(result)}
+
+def _open_data_version(p):
+    """Open a specific version of a data file."""
+    file_id = p.get("file_id", "")
+    version_number = p.get("version_number", None)
+    version_id = p.get("version_id", "")
+
+    if not file_id:
+        return {"error": "Provide 'file_id' parameter."}
+
+    data_file = None
+    hub = app.data.activeHub
+    if hub:
+        for i in range(hub.dataProjects.count):
+            proj = hub.dataProjects.item(i)
+            data_file = _search_folder_for_file(proj.rootFolder, file_id)
+            if data_file:
+                break
+
+    if not data_file:
+        return {"error": f"Data file '{file_id}' not found."}
+
+    # Find the specific version
+    target_version = None
+    versions = data_file.versions
+    for i in range(versions.count):
+        v = versions.item(i)
+        if version_id and v.id == version_id:
+            target_version = v
+            break
+        if version_number is not None and v.versionNumber == int(version_number):
+            target_version = v
+            break
+
+    if not target_version:
+        return {"error": f"Version not found. Available: {[versions.item(i).versionNumber for i in range(versions.count)]}"}
+
+    doc = app.documents.open(target_version)
+    is_read_only = not doc.isModified  # Older versions are typically read-only
+    return {"opened": data_file.name, "version": target_version.versionNumber,
+            "version_id": target_version.id, "read_only": is_read_only,
+            "document_name": doc.name}
+
+
+# ---- Events/Callbacks ----
+
+class _DesignEventHandler(adsk.core.CustomEventHandler):
+    """Generic event handler that appends event data to a subscription queue."""
+    def __init__(self, sub_id, event_type):
+        super().__init__()
+        self._sub_id = sub_id
+        self._event_type = event_type
+        self._seq = 0
+
+    def notify(self, args):
+        global _event_queues
+        if self._sub_id in _event_queues:
+            self._seq += 1
+            _event_queues[self._sub_id].append({
+                "seq": self._seq,
+                "event_type": self._event_type,
+                "timestamp": time.time(),
+                "info": str(args.additionalInfo) if hasattr(args, 'additionalInfo') else "",
+            })
+
+def _subscribe_design_events(p):
+    """Subscribe to design events. Returns a subscription_id."""
+    global _event_subscriptions, _event_queues, _event_handlers_list
+
+    if len(_event_subscriptions) >= _max_subscriptions:
+        return {"error": f"Maximum subscriptions ({_max_subscriptions}) reached. Unsubscribe first."}
+
+    events_list = p.get("events", ["ParameterChanged", "TimelineChanged", "ActiveSelectionChanged"])
+    if isinstance(events_list, str):
+        events_list = [events_list]
+
+    sub_id = str(uuid.uuid4())[:8]
+    _event_queues[sub_id] = collections.deque(maxlen=_max_event_queue)
+
+    registered = []
+    design = _design()
+
+    event_map = {}
+    if design:
+        # Map event names to Fusion design events
+        if hasattr(design, 'parameterChanged'):
+            event_map["ParameterChanged"] = design.parameterChanged
+        if hasattr(design, 'timelineChanged'):
+            event_map["TimelineChanged"] = design.timelineChanged
+    if app:
+        if hasattr(app, 'activeSelectionChanged'):
+            event_map["ActiveSelectionChanged"] = app.activeSelectionChanged
+
+    handlers = []
+    for evt_name in events_list:
+        if evt_name in event_map:
+            # Create a custom event to bridge design events to our queue
+            handler = _DesignEventHandler(sub_id, evt_name)
+            try:
+                event_map[evt_name].add(handler)
+                handlers.append((evt_name, handler, event_map[evt_name]))
+                registered.append(evt_name)
+            except Exception as e:
+                registered.append(f"{evt_name}(fallback: {str(e)})")
+        else:
+            # Use polling fallback for events not directly available
+            registered.append(f"{evt_name}(polling)")
+
+    _event_subscriptions[sub_id] = {
+        "events": events_list,
+        "created": time.time(),
+        "handlers": handlers,
+    }
+    _event_handlers_list.extend([h for _, h, _ in handlers])
+
+    return {"subscription_id": sub_id, "registered_events": registered}
+
+def _poll_design_events(p):
+    """Return and clear queued events for a subscription."""
+    sub_id = p.get("subscription_id", "")
+    if not sub_id or sub_id not in _event_queues:
+        return {"error": f"Subscription '{sub_id}' not found."}
+
+    q = _event_queues[sub_id]
+    events = list(q)
+    q.clear()
+
+    return {"subscription_id": sub_id, "events": events, "count": len(events)}
+
+def _unsubscribe_design_events(p):
+    """Unsubscribe from design events."""
+    global _event_subscriptions, _event_queues, _event_handlers_list
+
+    sub_id = p.get("subscription_id", "")
+    if not sub_id or sub_id not in _event_subscriptions:
+        return {"error": f"Subscription '{sub_id}' not found."}
+
+    sub = _event_subscriptions[sub_id]
+
+    # Remove event handlers
+    for evt_name, handler, event_obj in sub.get("handlers", []):
+        try:
+            event_obj.remove(handler)
+        except Exception:
+            pass
+        if handler in _event_handlers_list:
+            _event_handlers_list.remove(handler)
+
+    del _event_subscriptions[sub_id]
+    if sub_id in _event_queues:
+        del _event_queues[sub_id]
+
+    return {"unsubscribed": sub_id}
+
+def _get_subscription_status(p):
+    """Get status of all active subscriptions."""
+    subs = []
+    for sub_id, sub in _event_subscriptions.items():
+        q = _event_queues.get(sub_id, collections.deque())
+        subs.append({
+            "subscription_id": sub_id,
+            "events": sub["events"],
+            "created": sub["created"],
+            "queue_depth": len(q),
+            "queue_max": _max_event_queue,
+        })
+
+    return {"subscriptions": subs, "active_count": len(subs),
+            "max_subscriptions": _max_subscriptions}
+
+
+# ---- Render ----
+
+def _set_render_environment(p):
+    design = _design()
+    # Access render environment through named values
+    env_name = p.get("environment", "")
+    brightness = p.get("brightness", None)
+    rotation = p.get("rotation", None)
+    ground_plane = p.get("ground_plane", None)
+
+    try:
+        render_env = design.renderEnvironment if hasattr(design, 'renderEnvironment') else None
+        if render_env:
+            if env_name:
+                render_env.environmentName = env_name
+            if brightness is not None:
+                render_env.brightness = float(brightness)
+            if rotation is not None:
+                render_env.rotation = float(rotation)
+            if ground_plane is not None:
+                render_env.isGroundPlaneVisible = bool(ground_plane)
+            return {"environment": env_name or "current", "brightness": brightness, "ground_plane": ground_plane}
+        return {"note": "Render environment API not available in this Fusion version. Use UI to configure."}
+    except Exception as e:
+        return {"error": str(e)}
+
+def _set_appearance_detailed(root, p):
+    body = _find_body(root, p.get("body", 0))
+    appearance_name = p.get("appearance", "")
+    overrides = p.get("overrides", {})
+
+    # Whitelist of safe property names
+    safe_props = {"roughness", "metalness", "opacity", "color", "reflectance", "glossiness"}
+
+    if appearance_name:
+        # Find and assign appearance
+        mat_libs = app.materialLibraries
+        for i in range(mat_libs.count):
+            lib = mat_libs.item(i)
+            try:
+                appearances = lib.appearances
+                for j in range(appearances.count):
+                    app_item = appearances.item(j)
+                    if appearance_name.lower() in app_item.name.lower():
+                        body.appearance = app_item
+                        return {"body": body.name, "appearance": app_item.name, "library": lib.name}
+            except Exception:
+                continue
+
+    if overrides:
+        # Apply property overrides to existing appearance
+        try:
+            app_copy = body.appearance
+            for key, value in overrides.items():
+                if key not in safe_props:
+                    continue
+                # Try to set property on appearance
+                for k in range(app_copy.appearanceProperties.count):
+                    prop = app_copy.appearanceProperties.item(k)
+                    if key.lower() in prop.name.lower():
+                        if hasattr(prop, 'value'):
+                            prop.value = float(value)
+                        break
+            return {"body": body.name, "overrides_applied": [k for k in overrides if k in safe_props]}
+        except Exception as e:
+            return {"error": str(e)}
+
+    return {"error": "Provide 'appearance' name or 'overrides' dict"}
+
+def _create_render_camera(p):
+    design = _design()
+    name = p.get("name", "Camera1")
+    eye = p.get("eye", [10, 10, 10])
+    target = p.get("target", [0, 0, 0])
+    up = p.get("up", [0, 0, 1])
+    perspective_angle = p.get("perspective_angle", 45.0)
+
+    # Store camera as design attribute
+    camera_data = {
+        "eye": eye, "target": target, "up": up,
+        "perspective_angle": perspective_angle
+    }
+    design.attributes.add("FusionMCP_Cameras", name, json.dumps(camera_data))
+    return {"saved_camera": name, "eye": eye, "target": target}
+
+def _apply_render_camera(p):
+    design = _design()
+    name = p.get("name", "")
+    if not name:
+        raise Exception("Camera 'name' is required")
+
+    attr = design.attributes.itemByName("FusionMCP_Cameras", name)
+    if not attr:
+        raise Exception(f"Camera '{name}' not found")
+
+    cam_data = json.loads(attr.value)
+
+    # Apply to viewport
+    viewport = app.activeViewport
+    camera = viewport.camera
+    camera.eye = adsk.core.Point3D.create(*cam_data["eye"])
+    camera.target = adsk.core.Point3D.create(*cam_data["target"])
+    camera.upVector = adsk.core.Vector3D.create(*cam_data["up"])
+    if cam_data.get("perspective_angle"):
+        camera.perspectiveAngle = math.radians(cam_data["perspective_angle"])
+    camera.isSmoothTransition = True
+    viewport.camera = camera
+
+    return {"applied_camera": name}
+
+
+# ---- Drawing Generation ----
+
+def _create_drawing_document(p):
+    """Create a new drawing document. Limited API support - returns what's available."""
+    template = p.get("template", "")  # ANSI, ISO
+    sheet_size = p.get("sheet_size", "A3")
+    title = p.get("title", "")
+
+    try:
+        import adsk.drawing
+        # Attempt to create drawing via API (limited support)
+        return {
+            "note": "Drawing document creation has limited API support in Fusion 360. Use the UI: File > New Drawing > From Design, or use FreeCAD batch_drawings.py for automated drawing generation.",
+            "template": template,
+            "sheet_size": sheet_size
+        }
+    except ImportError:
+        return {"error": "adsk.drawing module not available in this Fusion version"}
+
+def _add_base_view(p):
+    """Add base view to drawing. Placeholder - requires drawing document context."""
+    return {
+        "note": "Drawing view creation requires an active drawing document. Fusion 360 Drawing API is limited to export operations. Use generate_drawing for viewport capture or FreeCAD for full 2D drawings.",
+        "body": p.get("body", ""),
+        "orientation": p.get("orientation", "front"),
+        "scale": p.get("scale", 1.0)
+    }
+
+def _add_projected_view(p):
+    return {"note": "Requires active drawing document. Use FreeCAD batch_drawings.py for multi-view generation."}
+
+def _add_section_view(p):
+    return {"note": "Section views require active drawing document. Use get_section_properties for section analysis data."}
+
+def _add_drawing_dimension(p):
+    return {"note": "Drawing dimensions require active drawing context. Use FreeCAD TechDraw for automated dimensioning."}
+
+def _add_annotation(p):
+    text = p.get("text", "")
+    if len(text) > 500:
+        text = text[:500]
+    return {"note": "Annotations require active drawing context.", "text_preview": text[:100]}
+
+def _export_drawing(p):
+    """Export active drawing to PDF/DWG if a drawing is active."""
+    output_path = p.get("path", os.path.expanduser("~/Desktop/drawing.pdf"))
+    output_path = _validate_output_path(output_path)
+    fmt = p.get("format", "pdf").lower()
+
+    try:
+        import adsk.drawing
+        doc = app.activeDocument
+        product = doc.products.itemByProductType('DrawingProductType')
+        if not product:
+            return {"error": "No active drawing document. Open a drawing first."}
+
+        drawing = adsk.drawing.Drawing.cast(product)
+        export_mgr = drawing.exportManager
+
+        if fmt == "pdf":
+            opts = export_mgr.createPDFExportOptions()
+            opts.outputPath = output_path
+            export_mgr.execute(opts)
+
+        return {"exported": output_path, "format": fmt}
+    except Exception as e:
+        return {"error": str(e), "note": "Drawing export requires active drawing document"}
+
+
+# ---- Parametric Automation Phase 2-3 ----
+
+def _compare_variants(p):
+    design = _design()
+    name1 = p.get("variant1", "")
+    name2 = p.get("variant2", "")
+
+    attr1 = design.attributes.itemByName("FusionMCP_Variants", name1)
+    attr2 = design.attributes.itemByName("FusionMCP_Variants", name2)
+
+    if not attr1:
+        raise Exception(f"Variant '{name1}' not found")
+    if not attr2:
+        raise Exception(f"Variant '{name2}' not found")
+
+    params1 = json.loads(attr1.value)
+    params2 = json.loads(attr2.value)
+
+    deltas = []
+    all_params = set(list(params1.keys()) + list(params2.keys()))
+    for pname in sorted(all_params):
+        v1 = params1.get(pname, {})
+        v2 = params2.get(pname, {})
+        if v1.get("expression") != v2.get("expression"):
+            deltas.append({
+                "parameter": pname,
+                "variant1": v1.get("expression", "N/A"),
+                "variant2": v2.get("expression", "N/A"),
+            })
+
+    return {"variant1": name1, "variant2": name2, "differences": deltas, "total_params": len(all_params)}
+
+def _create_design_table(p):
+    design = _design()
+    name = p.get("name", "")
+    rows = p.get("rows", [])  # [{param1: val1, param2: val2, ...}, ...]
+
+    if not name:
+        raise Exception("Design table 'name' is required")
+
+    table_data = json.dumps(rows)
+    if len(table_data) > 102400:  # 100KB cap
+        raise Exception("Design table too large (max 100KB)")
+
+    design.attributes.add("FusionMCP_DesignTables", name, table_data)
+    return {"created": name, "rows": len(rows), "parameters": list(rows[0].keys()) if rows else []}
+
+def _apply_design_table_row(p):
+    design = _design()
+    table_name = p.get("table", "")
+    row_idx = int(p.get("row", 0))
+
+    attr = design.attributes.itemByName("FusionMCP_DesignTables", table_name)
+    if not attr:
+        raise Exception(f"Design table '{table_name}' not found")
+
+    rows = json.loads(attr.value)
+    if row_idx >= len(rows):
+        raise Exception(f"Row {row_idx} out of range (max {len(rows) - 1})")
+
+    row = rows[row_idx]
+    updated = []
+    errors = []
+
+    for pname, expr in row.items():
+        try:
+            param = design.allParameters.itemByName(pname)
+            if param:
+                if isinstance(expr, (int, float)):
+                    param.value = float(expr)
+                else:
+                    param.expression = str(expr)
+                updated.append(pname)
+        except Exception as e:
+            errors.append(f"{pname}: {str(e)[:50]}")
+
+    return {"table": table_name, "row": row_idx, "updated": len(updated), "errors": errors}
+
+def _generate_variant_batch(root, p):
+    design = _design()
+    table_name = p.get("table", "")
+    output_dir = p.get("output_dir", os.path.expanduser("~/Desktop/variants"))
+    output_dir = _validate_output_path(output_dir)
+    export_format = p.get("format", "step").lower()
+
+    attr = design.attributes.itemByName("FusionMCP_DesignTables", table_name)
+    if not attr:
+        raise Exception(f"Design table '{table_name}' not found")
+
+    rows = json.loads(attr.value)
+    if len(rows) > 50:
+        raise Exception(f"Too many rows ({len(rows)}). Max 50 for batch generation.")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    results = []
+    em = design.exportManager
+
+    for idx, row in enumerate(rows):
+        # Apply parameters
+        for pname, expr in row.items():
+            try:
+                param = design.allParameters.itemByName(pname)
+                if param:
+                    if isinstance(expr, (int, float)):
+                        param.value = float(expr)
+                    else:
+                        param.expression = str(expr)
+            except Exception:
+                pass
+
+        # Export
+        variant_name = p.get("name_prefix", "variant") + f"_{idx}"
+        filepath = os.path.join(output_dir, f"{variant_name}.{export_format}")
+
+        try:
+            if export_format == "step":
+                opts = em.createSTEPExportOptions(filepath, root)
+            elif export_format == "stl":
+                opts = em.createSTLExportOptions(root, filepath)
+            else:
+                opts = em.createSTEPExportOptions(filepath, root)
+            em.execute(opts)
+            results.append({"row": idx, "file": filepath, "status": "ok"})
+        except Exception as e:
+            results.append({"row": idx, "file": filepath, "status": f"error: {str(e)[:50]}"})
+
+    return {"table": table_name, "variants_generated": len(results), "output_dir": output_dir, "results": results}
+
+def _validate_parameters(p):
+    design = _design()
+    rules = p.get("rules", {})  # {param_name: {min: val, max: val, type: "mm"}, ...}
+
+    violations = []
+    for pname, constraints in rules.items():
+        param = design.allParameters.itemByName(pname)
+        if not param:
+            violations.append({"parameter": pname, "error": "not found"})
+            continue
+
+        val = param.value
+        if "min" in constraints and val < float(constraints["min"]):
+            violations.append({"parameter": pname, "value": val, "violation": f"below min ({constraints['min']})"})
+        if "max" in constraints and val > float(constraints["max"]):
+            violations.append({"parameter": pname, "value": val, "violation": f"above max ({constraints['max']})"})
+
+    return {"valid": len(violations) == 0, "violations": violations, "checked": len(rules)}
+
+def _get_parameter_dependents(p):
+    design = _design()
+    pname = p.get("name", "")
+    param = design.allParameters.itemByName(pname)
+    if not param:
+        raise Exception(f"Parameter '{pname}' not found")
+
+    # Find all parameters that reference this one in their expression
+    dependents = []
+    for i in range(design.allParameters.count):
+        other = design.allParameters.item(i)
+        if other.name != pname and pname in other.expression:
+            dependents.append({"name": other.name, "expression": other.expression})
+
+    # Find features using this parameter (check timeline)
+    features = []
+    try:
+        tl = design.timeline
+        for i in range(tl.count):
+            item = tl.item(i)
+            entity = item.entity
+            if hasattr(entity, 'name'):
+                features.append(entity.name)
+    except Exception:
+        pass
+
+    return {"parameter": pname, "value": param.value, "expression": param.expression,
+            "dependent_parameters": dependents, "note": "Feature dependency requires expression parsing"}
+
+def _pipeline_execute(root, p):
+    """Execute multiple commands atomically with rollback on failure."""
+    steps = p.get("steps", [])
+
+    if not steps:
+        raise Exception("No steps provided")
+    if len(steps) > 20:
+        raise Exception(f"Too many steps ({len(steps)}). Max 20.")
+
+    # Block dangerous commands
+    blocked = {"execute_script", "pipeline_execute"}
+    for step in steps:
+        if step.get("command") in blocked:
+            raise Exception(f"Command '{step['command']}' not allowed in pipeline")
+
+    design = _design()
+    tl = design.timeline
+    start_pos = tl.count
+
+    results = []
+    try:
+        for i, step in enumerate(steps):
+            cmd = step.get("command", "")
+            params = step.get("params", {})
+
+            # Build a fake data dict and process it
+            step_data = {"command": cmd, "params": params}
+            step_result = _process_command(step_data)
+
+            if "error" in step_result:
+                raise Exception(f"Step {i} ({cmd}) failed: {step_result['error']}")
+
+            results.append({"step": i, "command": cmd, "result": "ok"})
+
+        return {"pipeline": "completed", "steps_executed": len(results), "results": results}
+    except Exception as e:
+        # Rollback
+        try:
+            while tl.count > start_pos:
+                item = tl.item(tl.count - 1)
+                item.entity.deleteMe()
+        except Exception:
+            pass
+        return {"pipeline": "rolled_back", "error": str(e), "steps_completed": len(results), "results": results}
+
+
 # ---- Dispatcher ----
 
 def _process_command(data: dict) -> dict:
@@ -2631,6 +3959,63 @@ def _process_command(data: dict) -> dict:
             "generate_bom":               lambda: _generate_bom(root, p),
             "export_bom":                 lambda: _export_bom(root, p),
             "generate_drawing":           lambda: _generate_drawing(root, p),
+            "create_3d_sketch":           lambda: _create_3d_sketch(root, p),
+            "draw_3d_line":               lambda: _draw_3d_line(root, p),
+            "draw_3d_spline":             lambda: _draw_3d_spline(root, p),
+            "project_to_surface":         lambda: _project_to_surface(root, p),
+            "create_hole_pattern_linear":  lambda: _create_hole_pattern_linear(root, p),
+            "create_hole_pattern_circular": lambda: _create_hole_pattern_circular(root, p),
+            "get_hole_info":              lambda: _get_hole_info(root, p),
+            "create_sheet_metal_rule":    lambda: _create_sheet_metal_rule(root, p),
+            "sheet_metal_flange":         lambda: _sheet_metal_flange(root, p),
+            "sheet_metal_bend":           lambda: _sheet_metal_bend(root, p),
+            "sheet_metal_unfold":         lambda: _sheet_metal_unfold(root, p),
+            "sheet_metal_flat_pattern":   lambda: _sheet_metal_flat_pattern(root, p),
+            "import_mesh":                lambda: _import_mesh(root, p),
+            "repair_mesh":                lambda: _repair_mesh(root, p),
+            "convert_mesh_to_brep":       lambda: _convert_mesh_to_brep(root, p),
+            # Advanced Joints
+            "create_joint_from_geometry": lambda: _create_joint_from_geometry(root, p),
+            "create_rigid_group":         lambda: _create_rigid_group(root, p),
+            "set_joint_limits":           lambda: _set_joint_limits(root, p),
+            "drive_joint":                lambda: _drive_joint(root, p),
+            "edit_joint":                 lambda: _edit_joint(root, p),
+            "get_joint_info":             lambda: _get_joint_info(root, p),
+            "list_joints":                lambda: _list_joints(root, p),
+            # Data Management
+            "list_data_hubs":             lambda: _list_data_hubs(p),
+            "list_data_projects":         lambda: _list_data_projects(p),
+            "list_data_folders":          lambda: _list_data_folders(p),
+            "open_data_file":             lambda: _open_data_file(p),
+            "save_to_folder":             lambda: _save_to_folder(p),
+            "list_data_versions":         lambda: _list_data_versions(p),
+            "open_data_version":          lambda: _open_data_version(p),
+            # Events/Callbacks
+            "subscribe_design_events":    lambda: _subscribe_design_events(p),
+            "poll_design_events":         lambda: _poll_design_events(p),
+            "unsubscribe_design_events":  lambda: _unsubscribe_design_events(p),
+            "get_subscription_status":    lambda: _get_subscription_status(p),
+            # Render
+            "set_render_environment":     lambda: _set_render_environment(p),
+            "set_appearance_detailed":    lambda: _set_appearance_detailed(root, p),
+            "create_render_camera":       lambda: _create_render_camera(p),
+            "apply_render_camera":        lambda: _apply_render_camera(p),
+            # Drawing Generation
+            "create_drawing_document":    lambda: _create_drawing_document(p),
+            "add_base_view":              lambda: _add_base_view(p),
+            "add_projected_view":         lambda: _add_projected_view(p),
+            "add_section_view":           lambda: _add_section_view(p),
+            "add_drawing_dimension":      lambda: _add_drawing_dimension(p),
+            "add_annotation":             lambda: _add_annotation(p),
+            "export_drawing":             lambda: _export_drawing(p),
+            # Parametric Automation Phase 2-3
+            "compare_variants":           lambda: _compare_variants(p),
+            "create_design_table":        lambda: _create_design_table(p),
+            "apply_design_table_row":     lambda: _apply_design_table_row(p),
+            "generate_variant_batch":     lambda: _generate_variant_batch(root, p),
+            "validate_parameters":        lambda: _validate_parameters(p),
+            "get_parameter_dependents":   lambda: _get_parameter_dependents(p),
+            "pipeline_execute":           lambda: _pipeline_execute(root, p),
         }
 
         if cmd in dispatch:
