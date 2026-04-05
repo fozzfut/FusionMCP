@@ -16,6 +16,7 @@ import queue
 import uuid
 import os
 import math
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer
 from contextlib import contextmanager
@@ -248,7 +249,8 @@ SKIP_GROUPING = {"undo", "redo", "get_info", "get_bodies_info", "get_face_info",
                   "check_wall_thickness", "check_draft_angles", "get_mesh_body_info",
                   "check_printability",
                   "cam_get_setups", "cam_list_tools", "cam_get_operation_info",
-                  "get_sketch_health", "list_variants", "generate_bom"}
+                  "get_sketch_health", "list_variants", "generate_bom",
+                  "export_bom"}
 
 @contextmanager
 def _timeline_group(label="MCP Operation"):
@@ -1737,6 +1739,8 @@ def _get_section_properties(root, p):
 def _get_curvature_info(root, p):
     body = _find_body(root, p.get("body", 0))
     face_idx = int(p.get("face", 0))
+    if face_idx < 0 or face_idx >= body.faces.count:
+        raise Exception(f"Face index {face_idx} out of range (0-{body.faces.count - 1})")
     face = body.faces.item(face_idx)
     evaluator = face.evaluator
     # Get curvature at face center (parametric midpoint)
@@ -2014,8 +2018,12 @@ def _cam_generate_toolpath(p):
         # Generate all
         future = cam.generateAllToolpaths(False)
 
-    # Wait for generation to complete
+    # Wait for generation with timeout to prevent infinite hang
+    max_wait = 300  # seconds
+    start_time = time.monotonic()
     while not future.isGenerationCompleted:
+        if time.monotonic() - start_time > max_wait:
+            return {"error": f"Toolpath generation timed out after {max_wait}s", "generated": False}
         adsk.doEvents()
 
     return {"generated": True, "status": "completed"}
@@ -2056,6 +2064,14 @@ def _cam_list_tools(p):
 
     return {"libraries": lib_urls}
 
+def _validate_output_path(path):
+    """Validate that an output path is within the user's home directory tree."""
+    resolved = os.path.realpath(path)
+    home = os.path.realpath(os.path.expanduser("~"))
+    if not resolved.startswith(home + os.sep) and resolved != home:
+        raise Exception(f"Path '{path}' is outside the user home directory. Only paths under '{home}' are allowed.")
+    return resolved
+
 def _cam_post_process(p):
     cam = _cam()
     setup_name = p.get("setup", "")
@@ -2067,6 +2083,11 @@ def _cam_post_process(p):
 
     if not post_config:
         raise Exception("Parameter 'post_config' is required (path to .cps post processor file)")
+
+    # Security: validate paths to prevent path traversal (CWE-22)
+    _validate_output_path(output_folder)
+    if not os.path.isfile(post_config):
+        raise Exception(f"Post processor config file not found: {post_config}")
 
     # Create post process input
     post_input = adsk.cam.PostProcessInput.create(output_name, post_config, output_folder, adsk.cam.PostOutputUnitOptions.MillimeterOutput)
@@ -2149,9 +2170,13 @@ def _edit_feature(p):
 
     entity = item.entity
 
-    # Try to edit the feature's parameters
+    # Try to edit the feature's parameters (block unsafe attribute names)
     edited = []
     for key, value in params.items():
+        # Security: reject dunder/private attributes to prevent CWE-915
+        if key.startswith("_") or key.startswith("__"):
+            edited.append(f"{key}: blocked (private/dunder attributes not allowed)")
+            continue
         try:
             if hasattr(entity, key):
                 setattr(entity, key, value)
@@ -2426,6 +2451,7 @@ def _generate_bom(root, p):
 def _export_bom(root, p):
     """Export BOM to JSON or CSV file."""
     output_path = p.get("path", os.path.expanduser("~/Desktop/bom.json"))
+    _validate_output_path(output_path)
     fmt = p.get("format", "json").lower()
 
     bom_data = _generate_bom(root, p)
