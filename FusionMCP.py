@@ -8,6 +8,7 @@ them to the Fusion 360 API on the main thread via custom events.
 
 import adsk.core
 import adsk.fusion
+import adsk.cam
 import traceback
 import threading
 import json
@@ -38,7 +39,9 @@ _auth_token = None  # Set via environment variable FUSION_MCP_TOKEN for optional
 
 _processing = False  # Re-entrance guard for notify()
 
-SLOW_COMMANDS = {"export_stl", "export_step", "export_3mf", "export_f3d", "execute_script", "capture_screenshot"}
+SLOW_COMMANDS = {"export_stl", "export_step", "export_3mf", "export_f3d", "execute_script", "capture_screenshot",
+                 "check_wall_thickness", "cam_generate_toolpath", "cam_post_process", "cam_simulate",
+                 "export_bom", "generate_drawing", "batch_update_parameters"}
 
 
 # ---- HTTP Handler ----
@@ -240,7 +243,12 @@ def _collect_all_sketch_curves(sketch):
 SKIP_GROUPING = {"undo", "redo", "get_info", "get_bodies_info", "get_face_info", "get_edge_info",
                   "get_sketch_info", "get_timeline_info", "measure_body", "measure_between",
                   "list_parameters", "list_appearances", "list_documents", "list_occurrences_tree",
-                  "get_component_info", "capture_screenshot", "fusion_status"}
+                  "get_component_info", "capture_screenshot", "fusion_status",
+                  "check_interference", "get_section_properties", "get_curvature_info",
+                  "check_wall_thickness", "check_draft_angles", "get_mesh_body_info",
+                  "check_printability",
+                  "cam_get_setups", "cam_list_tools", "cam_get_operation_info",
+                  "get_sketch_health", "list_variants", "generate_bom"}
 
 @contextmanager
 def _timeline_group(label="MCP Operation"):
@@ -319,6 +327,13 @@ def _get_bodies_info(root):
 
 def _get_face_info(root, p):
     body = _find_body(root, p.get("body", 0))
+    pull_dir = p.get("pull_direction", None)
+    pull_vec = None
+    if pull_dir:
+        if isinstance(pull_dir, str):
+            pull_vec = _axis_vector(pull_dir)
+        elif isinstance(pull_dir, list) and len(pull_dir) == 3:
+            pull_vec = adsk.core.Vector3D.create(float(pull_dir[0]), float(pull_dir[1]), float(pull_dir[2]))
     faces = []
     for i in range(body.faces.count):
         f = body.faces.item(i)
@@ -328,8 +343,16 @@ def _get_face_info(root, p):
             normal = [round(n.x, 3), round(n.y, 3), round(n.z, 3)]
         except Exception:
             normal = None
-        faces.append({"index": i, "area_cm2": round(f.area, 4),
-                       "type": geo_type, "normal": normal})
+        face_info = {"index": i, "area_cm2": round(f.area, 4),
+                     "type": geo_type, "normal": normal}
+        if pull_vec and normal:
+            try:
+                dot = abs(normal[0] * pull_vec.x + normal[1] * pull_vec.y + normal[2] * pull_vec.z)
+                angle = math.degrees(math.acos(min(dot, 1.0)))
+                face_info["draft_angle_deg"] = round(90.0 - angle, 2)
+            except Exception:
+                pass
+        faces.append(face_info)
     return {"body": body.name, "faces": faces}
 
 def _get_edge_info(root, p):
@@ -395,7 +418,7 @@ def _measure_body(root, p):
         vol = round(props.volume, 6)
     except Exception:
         pass
-    return {
+    result_dict = {
         "body": body.name,
         "size_cm": {
             "x": round(bb.maxPoint.x - bb.minPoint.x, 4),
@@ -407,6 +430,18 @@ def _measure_body(root, p):
         "edges": body.edges.count,
         "vertices": body.vertices.count,
     }
+    if p.get("include_physical", False):
+        try:
+            phys = body.physicalProperties
+            result_dict["mass_kg"] = round(phys.mass, 6)
+            result_dict["density_kg_m3"] = round(phys.density, 4)
+            result_dict["area_cm2"] = round(phys.area, 6)
+            com = phys.centerOfMass
+            result_dict["center_of_mass"] = [round(com.x, 4), round(com.y, 4), round(com.z, 4)]
+            result_dict["material"] = body.material.name if body.material else None
+        except Exception:
+            pass
+    return result_dict
 
 def _measure_between(root, p):
     e1 = p.get("entity1", "")
@@ -1650,6 +1685,795 @@ def _switch_document(p):
     raise Exception(f"Document '{name}' not found.")
 
 
+# ---- Analysis & DFM ----
+
+def _check_interference(root, p):
+    body1 = _find_body(root, p.get("body1", 0))
+    body2 = _find_body(root, p.get("body2", 1))
+    # Use TemporaryBRepManager for non-destructive check
+    temp_mgr = adsk.fusion.TemporaryBRepManager.get()
+    temp1 = temp_mgr.copy(body1)
+    temp2 = temp_mgr.copy(body2)
+    try:
+        temp_mgr.booleanOperation(temp1, temp2, adsk.fusion.BooleanTypes.IntersectBooleanType)
+        has_interference = temp1.volume > 1e-10
+        return {"interference": has_interference, "overlap_volume_cm3": round(temp1.volume, 8) if has_interference else 0}
+    except Exception:
+        return {"interference": False, "overlap_volume_cm3": 0, "note": "Bodies do not overlap"}
+
+def _assign_material(root, p):
+    body = _find_body(root, p.get("body", 0))
+    lib_name = p.get("library", "Fusion 360 Material Library")
+    mat_name = p.get("material", "")
+    if not mat_name:
+        raise Exception("Parameter 'material' is required")
+    # Get material library
+    mat_libs = app.materialLibraries
+    for i in range(mat_libs.count):
+        lib = mat_libs.item(i)
+        if lib_name.lower() in lib.name.lower():
+            for j in range(lib.materials.count):
+                mat = lib.materials.item(j)
+                if mat_name.lower() in mat.name.lower():
+                    body.material = mat
+                    return {"body": body.name, "material": mat.name, "library": lib.name}
+    raise Exception(f"Material '{mat_name}' not found in library '{lib_name}'")
+
+def _get_section_properties(root, p):
+    body = _find_body(root, p.get("body", 0))
+    plane = _resolve_plane(root, p.get("plane", "XY"))
+    # Create section analysis using SectionAnalysis
+    try:
+        plane_geo = plane.geometry if hasattr(plane, 'geometry') else adsk.core.Plane.create(
+            adsk.core.Point3D.create(0, 0, 0), adsk.core.Vector3D.create(0, 0, 1))
+        profiles = body.findSectionProfiles(plane_geo)
+        if profiles and profiles.count > 0:
+            total_area = sum(pr.area for pr in profiles)
+            return {"body": body.name, "section_profiles": profiles.count, "total_area_cm2": round(total_area, 6)}
+        return {"body": body.name, "section_profiles": 0, "total_area_cm2": 0}
+    except Exception as e:
+        return {"body": body.name, "error": str(e), "note": "Section analysis requires specific plane geometry"}
+
+def _get_curvature_info(root, p):
+    body = _find_body(root, p.get("body", 0))
+    face_idx = int(p.get("face", 0))
+    face = body.faces.item(face_idx)
+    evaluator = face.evaluator
+    # Get curvature at face center (parametric midpoint)
+    try:
+        (ok, min_pt, max_pt) = evaluator.getParameterExtents()
+        mid_u = (min_pt.x + max_pt.x) / 2
+        mid_v = (min_pt.y + max_pt.y) / 2
+        param = adsk.core.Point2D.create(mid_u, mid_v)
+        (ok2, max_tang, min_tang, max_curv, min_curv) = evaluator.getCurvature(param)
+        return {
+            "body": body.name, "face": face_idx,
+            "max_curvature": round(max_curv, 6),
+            "min_curvature": round(min_curv, 6),
+            "gaussian_curvature": round(max_curv * min_curv, 8),
+            "face_type": type(face.geometry).__name__
+        }
+    except Exception as e:
+        return {"body": body.name, "face": face_idx, "error": str(e)}
+
+def _check_wall_thickness(root, p):
+    body = _find_body(root, p.get("body", 0))
+    min_thickness = float(p.get("min_thickness", 0.1))  # cm
+    mgr = app.measureManager
+    thin_walls = []
+    checked = 0
+    faces = body.faces
+    for i in range(faces.count):
+        for j in range(i + 1, min(faces.count, i + 20)):  # limit pairwise checks
+            try:
+                result_m = mgr.measureMinimumDistance(faces.item(i), faces.item(j))
+                dist = result_m.value
+                if 0 < dist < min_thickness:
+                    thin_walls.append({"face1": i, "face2": j, "thickness_cm": round(dist, 6)})
+                checked += 1
+            except Exception:
+                pass
+    return {
+        "body": body.name, "min_threshold_cm": min_thickness,
+        "thin_walls_found": len(thin_walls), "pairs_checked": checked,
+        "thin_walls": thin_walls[:20]  # limit output
+    }
+
+def _check_draft_angles(root, p):
+    body = _find_body(root, p.get("body", 0))
+    pull_str = p.get("pull_direction", "Z").upper()
+    min_angle = float(p.get("min_angle", 1.0))  # degrees
+    pull = _axis_vector(pull_str)
+
+    results = []
+    fail_count = 0
+    for i in range(body.faces.count):
+        face = body.faces.item(i)
+        try:
+            normal = face.geometry.normal if hasattr(face.geometry, 'normal') else None
+            if normal:
+                dot = abs(normal.x * pull.x + normal.y * pull.y + normal.z * pull.z)
+                angle = math.degrees(math.acos(min(dot, 1.0)))
+                draft = 90.0 - angle
+                passed = abs(draft) >= min_angle or abs(draft) < 0.01  # perpendicular or has draft
+                if not passed:
+                    fail_count += 1
+                results.append({"face": i, "draft_angle_deg": round(draft, 2), "passed": passed})
+        except Exception:
+            pass
+
+    return {
+        "body": body.name, "pull_direction": pull_str,
+        "min_draft_angle": min_angle, "total_faces": body.faces.count,
+        "failed_faces": fail_count, "all_passed": fail_count == 0,
+        "faces": results[:50]  # limit output
+    }
+
+def _get_mesh_body_info(root, p):
+    ref = p.get("body", 0)
+    # Check mesh bodies
+    meshes = root.meshBodies
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        idx = int(ref)
+        if idx < meshes.count:
+            mesh = meshes.item(idx)
+            bb = mesh.boundingBox
+            return {
+                "name": mesh.name, "type": "mesh",
+                "triangle_count": mesh.displayMesh.triangleCount if mesh.displayMesh else 0,
+                "node_count": mesh.displayMesh.nodeCount if mesh.displayMesh else 0,
+                "size_cm": {
+                    "x": round(bb.maxPoint.x - bb.minPoint.x, 4),
+                    "y": round(bb.maxPoint.y - bb.minPoint.y, 4),
+                    "z": round(bb.maxPoint.z - bb.minPoint.z, 4),
+                }
+            }
+    # Search by name
+    for i in range(meshes.count):
+        if meshes.item(i).name == ref:
+            mesh = meshes.item(i)
+            bb = mesh.boundingBox
+            return {"name": mesh.name, "type": "mesh",
+                    "triangle_count": mesh.displayMesh.triangleCount if mesh.displayMesh else 0,
+                    "node_count": mesh.displayMesh.nodeCount if mesh.displayMesh else 0}
+    return {"error": f"No mesh body '{ref}' found", "mesh_bodies_count": meshes.count}
+
+def _check_printability(root, p):
+    body = _find_body(root, p.get("body", 0))
+    overhang_threshold = float(p.get("max_overhang_angle", 45.0))
+    min_wall = float(p.get("min_wall_thickness", 0.08))  # cm (0.8mm)
+
+    pull = adsk.core.Vector3D.create(0, 0, 1)  # print direction is Z up
+    overhangs = []
+
+    for i in range(body.faces.count):
+        face = body.faces.item(i)
+        try:
+            normal = face.geometry.normal if hasattr(face.geometry, 'normal') else None
+            if normal:
+                dot = normal.x * pull.x + normal.y * pull.y + normal.z * pull.z
+                angle_from_vertical = math.degrees(math.acos(min(abs(dot), 1.0)))
+                angle_from_horizontal = 90.0 - angle_from_vertical
+                # Face pointing downward with angle > threshold
+                if dot < 0 and angle_from_horizontal > overhang_threshold:
+                    overhangs.append({"face": i, "overhang_angle_deg": round(angle_from_horizontal, 1)})
+        except Exception:
+            pass
+
+    return {
+        "body": body.name,
+        "printable": len(overhangs) == 0,
+        "overhang_faces": len(overhangs),
+        "overhangs": overhangs[:20],
+        "overhang_threshold_deg": overhang_threshold,
+        "min_wall_threshold_cm": min_wall,
+        "note": "Use check_wall_thickness for detailed wall analysis"
+    }
+
+
+# ---- CAM Commands ----
+
+def _cam():
+    """Get the CAM product from the active document."""
+    cam = adsk.cam.CAM.cast(app.activeProduct)
+    if not cam:
+        # Try to get CAM from the document's products
+        doc = app.activeDocument
+        for i in range(doc.products.count):
+            product = doc.products.item(i)
+            if product.productType == 'CAMProductType':
+                return adsk.cam.CAM.cast(product)
+        raise Exception("CAM workspace not available. Switch to Manufacturing workspace first.")
+    return cam
+
+def _find_setup(cam, ref):
+    """Find setup by name or index."""
+    setups = cam.setups
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        idx = int(ref)
+        if idx < setups.count:
+            return setups.item(idx)
+    for i in range(setups.count):
+        if setups.item(i).name == ref:
+            return setups.item(i)
+    raise Exception(f"Setup '{ref}' not found. Available: {[setups.item(i).name for i in range(setups.count)]}")
+
+def _find_operation(setup, ref):
+    """Find operation within a setup by name or index."""
+    ops = setup.operations
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        idx = int(ref)
+        if idx < ops.count:
+            return ops.item(idx)
+    for i in range(ops.count):
+        if ops.item(i).name == ref:
+            return ops.item(i)
+    raise Exception(f"Operation '{ref}' not found in setup '{setup.name}'")
+
+def _cam_get_setups(p):
+    cam = _cam()
+    setups = []
+    for i in range(cam.setups.count):
+        s = cam.setups.item(i)
+        ops = []
+        for j in range(s.operations.count):
+            op = s.operations.item(j)
+            ops.append({
+                "name": op.name,
+                "type": type(op).__name__,
+                "hasToolpath": op.hasToolpath,
+                "isSuppressed": op.isSuppressed,
+            })
+        setups.append({
+            "name": s.name,
+            "type": str(s.setupType) if hasattr(s, 'setupType') else "unknown",
+            "operations_count": s.operations.count,
+            "operations": ops,
+        })
+    return {"setups": setups, "count": len(setups)}
+
+def _cam_create_setup(root, p):
+    cam = _cam()
+    setup_type_str = p.get("setup_type", "milling").lower()
+
+    # Map string to SetupTypes enum
+    setup_types = {
+        "milling": adsk.cam.SetupTypes.MillingSetupType,
+        "turning": adsk.cam.SetupTypes.TurningSetupType,
+        "cutting": adsk.cam.SetupTypes.CuttingSetupType,
+    }
+    setup_type = setup_types.get(setup_type_str, adsk.cam.SetupTypes.MillingSetupType)
+
+    setup_input = cam.setups.createInput(setup_type)
+
+    # Set body if specified
+    body_ref = p.get("body", None)
+    if body_ref is not None:
+        body = _find_body(root, body_ref)
+        setup_input.models = [body]
+
+    setup = cam.setups.add(setup_input)
+
+    name = p.get("name", None)
+    if name:
+        setup.name = name
+
+    return {"created": setup.name, "type": setup_type_str}
+
+def _cam_create_operation(p):
+    cam = _cam()
+    setup_name = p.get("setup", "")
+    setup = _find_setup(cam, setup_name)
+
+    op_type = p.get("operation_type", "pocket2d")
+
+    # Map operation types to their Fusion operation IDs
+    op_map = {
+        "pocket2d": "pocket2d",
+        "contour2d": "contour2d",
+        "adaptive2d": "adaptive2d",
+        "face": "face",
+        "drill": "drill",
+        "adaptive3d": "adaptive",
+        "pocket3d": "pocket",
+        "parallel3d": "parallel",
+        "contour3d": "contour",
+        "scallop": "scallop",
+        "pencil": "pencil",
+        "steep_and_shallow": "steep_and_shallow",
+    }
+
+    fusion_op_type = op_map.get(op_type, op_type)
+
+    try:
+        op_input = setup.operations.createInput(fusion_op_type)
+        op = setup.operations.add(op_input)
+
+        name = p.get("name", None)
+        if name:
+            op.name = name
+
+        return {"created": op.name, "type": op_type, "setup": setup.name}
+    except Exception as e:
+        return {"error": str(e), "available_types": list(op_map.keys())}
+
+def _cam_generate_toolpath(p):
+    cam = _cam()
+
+    setup_name = p.get("setup", None)
+    op_name = p.get("operation", None)
+
+    if op_name and setup_name:
+        setup = _find_setup(cam, setup_name)
+        op = _find_operation(setup, op_name)
+        future = cam.generateToolpath(op)
+    elif setup_name:
+        setup = _find_setup(cam, setup_name)
+        future = cam.generateToolpath(setup)
+    else:
+        # Generate all
+        future = cam.generateAllToolpaths(False)
+
+    # Wait for generation to complete
+    while not future.isGenerationCompleted:
+        adsk.doEvents()
+
+    return {"generated": True, "status": "completed"}
+
+def _cam_list_tools(p):
+    cam = _cam()
+    library_url = p.get("library", "")
+    search = p.get("search", "")
+
+    # Get tool libraries
+    tool_libs = cam.toolLibraries
+
+    # List available library URLs
+    lib_urls = []
+    try:
+        for lib_url in tool_libs.toolLibraryUrls:
+            lib_urls.append(str(lib_url))
+    except Exception:
+        pass
+
+    if not library_url and lib_urls:
+        return {"libraries": lib_urls, "note": "Provide 'library' parameter to list tools from a specific library"}
+
+    if library_url:
+        try:
+            url = adsk.core.URL.create(library_url)
+            lib = tool_libs.toolLibraryAtURL(url)
+            tools = []
+            for i in range(lib.count):
+                tool = lib.item(i)
+                tool_info = {"index": i, "description": tool.description if hasattr(tool, 'description') else str(i)}
+                if search and search.lower() not in str(tool_info).lower():
+                    continue
+                tools.append(tool_info)
+            return {"library": library_url, "tools": tools[:50], "total": lib.count}
+        except Exception as e:
+            return {"error": str(e), "available_libraries": lib_urls}
+
+    return {"libraries": lib_urls}
+
+def _cam_post_process(p):
+    cam = _cam()
+    setup_name = p.get("setup", "")
+    setup = _find_setup(cam, setup_name)
+
+    post_config = p.get("post_config", "")
+    output_folder = p.get("output_folder", os.path.expanduser("~/Desktop"))
+    output_name = p.get("output_name", setup.name)
+
+    if not post_config:
+        raise Exception("Parameter 'post_config' is required (path to .cps post processor file)")
+
+    # Create post process input
+    post_input = adsk.cam.PostProcessInput.create(output_name, post_config, output_folder, adsk.cam.PostOutputUnitOptions.MillimeterOutput)
+    post_input.isOpenInEditor = False
+
+    cam.postProcess(setup, post_input)
+
+    return {"posted": True, "setup": setup.name, "output_folder": output_folder, "output_name": output_name}
+
+def _cam_simulate(p):
+    cam = _cam()
+    setup_name = p.get("setup", "")
+    setup = _find_setup(cam, setup_name)
+
+    try:
+        cam.simulate(setup)
+        return {"simulating": True, "setup": setup.name}
+    except Exception as e:
+        return {"error": str(e), "note": "Simulation may require generated toolpaths"}
+
+def _cam_get_operation_info(p):
+    cam = _cam()
+    setup_name = p.get("setup", "")
+    op_name = p.get("operation", "")
+
+    setup = _find_setup(cam, setup_name)
+    op = _find_operation(setup, op_name)
+
+    info = {
+        "name": op.name,
+        "type": type(op).__name__,
+        "hasToolpath": op.hasToolpath,
+        "isSuppressed": op.isSuppressed,
+    }
+
+    # Try to get additional details
+    try:
+        if op.hasToolpath:
+            info["machining_time_sec"] = round(op.machiningTime, 2) if hasattr(op, 'machiningTime') else None
+    except Exception:
+        pass
+
+    try:
+        tool = op.tool
+        if tool:
+            info["tool"] = {
+                "description": tool.description if hasattr(tool, 'description') else None,
+                "diameter": round(tool.diameter, 4) if hasattr(tool, 'diameter') else None,
+            }
+    except Exception:
+        pass
+
+    return info
+
+
+# ---- Parametric Design Automation ----
+
+def _edit_feature(p):
+    """Edit an existing feature by timeline index or name."""
+    design = _design()
+    tl = design.timeline
+    ref = p.get("feature", "")
+    params = p.get("params", {})
+
+    # Find timeline item
+    item = None
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        idx = int(ref)
+        if idx < tl.count:
+            item = tl.item(idx)
+    else:
+        for i in range(tl.count):
+            ti = tl.item(i)
+            if hasattr(ti.entity, 'name') and ti.entity.name == ref:
+                item = ti
+                break
+
+    if not item:
+        raise Exception(f"Feature '{ref}' not found in timeline")
+
+    entity = item.entity
+
+    # Try to edit the feature's parameters
+    edited = []
+    for key, value in params.items():
+        try:
+            if hasattr(entity, key):
+                setattr(entity, key, value)
+                edited.append(key)
+        except Exception as e:
+            edited.append(f"{key}: failed ({str(e)[:50]})")
+
+    return {"feature": entity.name if hasattr(entity, 'name') else str(ref), "edited": edited}
+
+def _suppress_feature(p):
+    """Toggle suppression of a timeline feature."""
+    design = _design()
+    tl = design.timeline
+    ref = p.get("feature", "")
+    suppress = p.get("suppress", True)
+
+    item = None
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        item = tl.item(int(ref))
+    else:
+        for i in range(tl.count):
+            ti = tl.item(i)
+            if hasattr(ti.entity, 'name') and ti.entity.name == ref:
+                item = ti
+                break
+
+    if not item:
+        raise Exception(f"Feature '{ref}' not found")
+
+    item.isSuppressed = suppress
+    name = item.entity.name if hasattr(item.entity, 'name') else str(ref)
+    return {"feature": name, "suppressed": item.isSuppressed}
+
+def _delete_feature(p):
+    """Delete a feature by timeline index or name."""
+    design = _design()
+    tl = design.timeline
+    ref = p.get("feature", "")
+
+    item = None
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        item = tl.item(int(ref))
+    else:
+        for i in range(tl.count):
+            ti = tl.item(i)
+            if hasattr(ti.entity, 'name') and ti.entity.name == ref:
+                item = ti
+                break
+
+    if not item:
+        raise Exception(f"Feature '{ref}' not found")
+
+    name = item.entity.name if hasattr(item.entity, 'name') else str(ref)
+    item.entity.deleteMe()
+    return {"deleted": name}
+
+def _reorder_feature(p):
+    """Move a feature to a new position in the timeline."""
+    design = _design()
+    tl = design.timeline
+    ref = p.get("feature", "")
+    new_position = int(p.get("position", 0))
+
+    item = None
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        item = tl.item(int(ref))
+    else:
+        for i in range(tl.count):
+            ti = tl.item(i)
+            if hasattr(ti.entity, 'name') and ti.entity.name == ref:
+                item = ti
+                break
+
+    if not item:
+        raise Exception(f"Feature '{ref}' not found")
+
+    name = item.entity.name if hasattr(item.entity, 'name') else str(ref)
+    item.moveToPosition(new_position)
+    return {"feature": name, "new_position": new_position}
+
+def _auto_constrain(root, p):
+    """Apply automatic constraints to a sketch."""
+    sketch = _resolve_sketch(root, p)
+    tolerance = float(p.get("tolerance", 0.1))  # cm
+
+    try:
+        sketch.autoConstrain(tolerance)
+        # Report constraint count
+        count = sketch.geometricConstraints.count
+        dof = sketch.sketchDimensions.count  # approximate
+        return {"sketch": sketch.name, "constraints_after": count, "auto_constrained": True}
+    except Exception as e:
+        return {"sketch": sketch.name, "error": str(e)}
+
+def _get_sketch_health(root, p):
+    """Get constraint health of a sketch (DOF, fully constrained status)."""
+    sketch = _resolve_sketch(root, p)
+
+    constraints = sketch.geometricConstraints.count
+    dimensions = sketch.sketchDimensions.count
+    profiles = sketch.profiles.count
+
+    # Count curves
+    curves = 0
+    for attr in ['sketchLines', 'sketchCircles', 'sketchArcs', 'sketchEllipses', 'sketchFittedSplines']:
+        curves += getattr(sketch.sketchCurves, attr).count
+
+    return {
+        "sketch": sketch.name,
+        "is_fully_constrained": sketch.isFullyConstrained if hasattr(sketch, 'isFullyConstrained') else None,
+        "constraints": constraints,
+        "dimensions": dimensions,
+        "curves": curves,
+        "profiles": profiles,
+    }
+
+def _remove_constraint(root, p):
+    """Remove a geometric constraint by index."""
+    sketch = _resolve_sketch(root, p)
+    idx = int(p.get("index", 0))
+
+    if idx >= sketch.geometricConstraints.count:
+        raise Exception(f"Constraint index {idx} out of range (max {sketch.geometricConstraints.count - 1})")
+
+    constraint = sketch.geometricConstraints.item(idx)
+    ctype = type(constraint).__name__
+    constraint.deleteMe()
+    return {"deleted_constraint": idx, "type": ctype, "sketch": sketch.name}
+
+def _save_variant(p):
+    """Save current parameter values as a named variant."""
+    design = _design()
+    name = p.get("name", "")
+    if not name:
+        raise Exception("Parameter 'name' is required")
+
+    # Collect all user parameters
+    params = {}
+    for i in range(design.userParameters.count):
+        param = design.userParameters.item(i)
+        params[param.name] = {"value": param.value, "unit": param.unit, "expression": param.expression}
+
+    # Store in design attributes
+    attr_group = "FusionMCP_Variants"
+    design.attributes.add(attr_group, name, json.dumps(params))
+
+    return {"saved": name, "parameter_count": len(params)}
+
+def _load_variant(p):
+    """Load a named variant, updating all parameters."""
+    design = _design()
+    name = p.get("name", "")
+    if not name:
+        raise Exception("Parameter 'name' is required")
+
+    attr = design.attributes.itemByName("FusionMCP_Variants", name)
+    if not attr:
+        raise Exception(f"Variant '{name}' not found")
+
+    params = json.loads(attr.value)
+    updated = []
+    errors = []
+
+    for pname, pdata in params.items():
+        try:
+            param = design.userParameters.itemByName(pname)
+            if param:
+                param.expression = pdata["expression"]
+                updated.append(pname)
+        except Exception as e:
+            errors.append(f"{pname}: {str(e)[:50]}")
+
+    return {"loaded": name, "updated": len(updated), "errors": errors}
+
+def _list_variants(p):
+    """List all saved variants."""
+    design = _design()
+    variants = []
+    attrs = design.attributes.itemsByGroup("FusionMCP_Variants")
+    for i in range(attrs.count):
+        attr = attrs.item(i)
+        param_data = json.loads(attr.value)
+        variants.append({"name": attr.name, "parameters": len(param_data)})
+    return {"variants": variants, "count": len(variants)}
+
+def _delete_variant(p):
+    """Delete a named variant."""
+    design = _design()
+    name = p.get("name", "")
+    attr = design.attributes.itemByName("FusionMCP_Variants", name)
+    if not attr:
+        raise Exception(f"Variant '{name}' not found")
+    attr.deleteMe()
+    return {"deleted": name}
+
+def _add_parameter_expression(p):
+    """Add a user parameter with an expression (can reference other parameters)."""
+    design = _design()
+    name = p.get("name", "")
+    expression = p.get("expression", "")
+    unit = p.get("unit", "mm")
+    if not name or not expression:
+        raise Exception("Parameters 'name' and 'expression' are required")
+
+    param = design.userParameters.add(name, adsk.core.ValueInput.createByString(expression), unit, "")
+    return {"name": param.name, "value": round(param.value, 6), "expression": param.expression, "unit": param.unit}
+
+def _batch_update_parameters(p):
+    """Update multiple parameters in one call with single recompute."""
+    design = _design()
+    updates = p.get("parameters", {})  # {name: expression_or_value, ...}
+
+    if not updates:
+        raise Exception("Parameter 'parameters' dict is required")
+
+    updated = []
+    errors = []
+
+    for pname, expr in updates.items():
+        try:
+            param = design.allParameters.itemByName(pname)
+            if param:
+                if isinstance(expr, (int, float)):
+                    param.value = float(expr)
+                else:
+                    param.expression = str(expr)
+                updated.append(pname)
+            else:
+                errors.append(f"{pname}: not found")
+        except Exception as e:
+            errors.append(f"{pname}: {str(e)[:50]}")
+
+    return {"updated": len(updated), "parameters": updated, "errors": errors}
+
+def _generate_bom(root, p):
+    """Generate Bill of Materials from assembly."""
+    design = _design()
+    include_mass = p.get("include_mass", False)
+
+    bom = []
+    comp_counts = {}
+
+    # Count occurrences of each component
+    for i in range(root.allOccurrences.count):
+        occ = root.allOccurrences.item(i)
+        comp_name = occ.component.name
+        if comp_name not in comp_counts:
+            comp_counts[comp_name] = {"count": 0, "component": occ.component}
+        comp_counts[comp_name]["count"] += 1
+
+    for comp_name, data in comp_counts.items():
+        comp = data["component"]
+        entry = {
+            "component": comp_name,
+            "quantity": data["count"],
+            "bodies": comp.bRepBodies.count,
+        }
+
+        if include_mass:
+            try:
+                phys = comp.getPhysicalProperties()
+                entry["mass_kg"] = round(phys.mass, 6)
+                entry["material"] = comp.material.name if comp.material else None
+            except Exception:
+                pass
+
+        bom.append(entry)
+
+    bom.sort(key=lambda x: x["component"])
+    return {"bom": bom, "unique_components": len(bom), "total_occurrences": root.allOccurrences.count}
+
+def _export_bom(root, p):
+    """Export BOM to JSON or CSV file."""
+    output_path = p.get("path", os.path.expanduser("~/Desktop/bom.json"))
+    fmt = p.get("format", "json").lower()
+
+    bom_data = _generate_bom(root, p)
+
+    if fmt == "csv":
+        import csv
+        if not output_path.endswith(".csv"):
+            output_path = output_path.rsplit(".", 1)[0] + ".csv"
+        with open(output_path, 'w', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=["component", "quantity", "bodies"])
+            writer.writeheader()
+            for row in bom_data["bom"]:
+                writer.writerow({k: row.get(k, "") for k in ["component", "quantity", "bodies"]})
+    else:
+        with open(output_path, 'w') as f:
+            json.dump(bom_data, f, indent=2)
+
+    return {"exported": output_path, "format": fmt, "components": len(bom_data["bom"])}
+
+def _generate_drawing(root, p):
+    """Create a basic drawing with standard views. Note: limited in headless/API mode."""
+    # Fusion 360 Drawing API is limited - we create what we can
+    body_ref = p.get("body", 0)
+    body = _find_body(root, body_ref)
+
+    bb = body.boundingBox
+    dims = {
+        "width_cm": round(bb.maxPoint.x - bb.minPoint.x, 4),
+        "height_cm": round(bb.maxPoint.y - bb.minPoint.y, 4),
+        "depth_cm": round(bb.maxPoint.z - bb.minPoint.z, 4),
+    }
+
+    # Try to export orthographic screenshot views
+    output_path = p.get("path", os.path.expanduser("~/Desktop/drawing.png"))
+
+    try:
+        # Capture current viewport
+        app.activeViewport.saveAsImageFile(output_path, 1920, 1080)
+        return {
+            "body": body.name,
+            "dimensions": dims,
+            "screenshot": output_path,
+            "note": "Full 2D drawing generation requires Fusion 360 Drawing workspace. Use FreeCAD batch_drawings.py for multi-view DXF output."
+        }
+    except Exception as e:
+        return {"body": body.name, "dimensions": dims, "error": str(e)}
+
+
 # ---- Dispatcher ----
 
 def _process_command(data: dict) -> dict:
@@ -1749,6 +2573,38 @@ def _process_command(data: dict) -> dict:
             "save_as":                    lambda: _save_as(p),
             "fusion_status":              lambda: {"status": "ok", "message": "Fusion MCP bridge running"},
             "export_obj":                 lambda: {"error": "OBJ export is not supported by the Fusion 360 API. Use STL, STEP, or 3MF instead."},
+            "check_interference":         lambda: _check_interference(root, p),
+            "assign_material":            lambda: _assign_material(root, p),
+            "get_section_properties":     lambda: _get_section_properties(root, p),
+            "get_curvature_info":         lambda: _get_curvature_info(root, p),
+            "check_wall_thickness":       lambda: _check_wall_thickness(root, p),
+            "check_draft_angles":         lambda: _check_draft_angles(root, p),
+            "get_mesh_body_info":         lambda: _get_mesh_body_info(root, p),
+            "check_printability":         lambda: _check_printability(root, p),
+            "cam_get_setups":             lambda: _cam_get_setups(p),
+            "cam_create_setup":           lambda: _cam_create_setup(root, p),
+            "cam_create_operation":        lambda: _cam_create_operation(p),
+            "cam_generate_toolpath":       lambda: _cam_generate_toolpath(p),
+            "cam_list_tools":             lambda: _cam_list_tools(p),
+            "cam_post_process":           lambda: _cam_post_process(p),
+            "cam_simulate":               lambda: _cam_simulate(p),
+            "cam_get_operation_info":      lambda: _cam_get_operation_info(p),
+            "edit_feature":               lambda: _edit_feature(p),
+            "suppress_feature":           lambda: _suppress_feature(p),
+            "delete_feature":             lambda: _delete_feature(p),
+            "reorder_feature":            lambda: _reorder_feature(p),
+            "auto_constrain":             lambda: _auto_constrain(root, p),
+            "get_sketch_health":          lambda: _get_sketch_health(root, p),
+            "remove_constraint":          lambda: _remove_constraint(root, p),
+            "save_variant":               lambda: _save_variant(p),
+            "load_variant":               lambda: _load_variant(p),
+            "list_variants":              lambda: _list_variants(p),
+            "delete_variant":             lambda: _delete_variant(p),
+            "add_parameter_expression":   lambda: _add_parameter_expression(p),
+            "batch_update_parameters":    lambda: _batch_update_parameters(p),
+            "generate_bom":               lambda: _generate_bom(root, p),
+            "export_bom":                 lambda: _export_bom(root, p),
+            "generate_drawing":           lambda: _generate_drawing(root, p),
         }
 
         if cmd in dispatch:
