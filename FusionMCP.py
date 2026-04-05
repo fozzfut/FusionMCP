@@ -16,6 +16,8 @@ import uuid
 import os
 import math
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer
+from contextlib import contextmanager
 
 app: adsk.core.Application = None
 ui: adsk.core.UserInterface = None
@@ -25,9 +27,12 @@ _handlers = []
 _cmd_queue: queue.Queue = queue.Queue()
 _results: dict = {}
 _result_events: dict = {}
+_lock = threading.Lock()
 
 CUSTOM_EVENT_ID = "FusionMCPTickV4"
 PORT = 7432
+
+SLOW_COMMANDS = {"export_stl", "export_step", "export_3mf", "export_f3d", "execute_script", "capture_screenshot"}
 
 
 # ---- HTTP Handler ----
@@ -55,14 +60,18 @@ class MCPRequestHandler(BaseHTTPRequestHandler):
     def _dispatch(self, data: dict) -> dict:
         cmd_id = str(uuid.uuid4())
         data["id"] = cmd_id
+        cmd = data.get("command", "")
+        timeout = 120 if cmd in SLOW_COMMANDS else 30
         event = threading.Event()
-        _result_events[cmd_id] = event
+        with _lock:
+            _result_events[cmd_id] = event
         _cmd_queue.put(data)
         if app:
             app.fireCustomEvent(CUSTOM_EVENT_ID, cmd_id)
-        event.wait(timeout=30)
-        result = _results.pop(cmd_id, {"error": "Timeout - Fusion did not respond in 30s"})
-        _result_events.pop(cmd_id, None)
+        event.wait(timeout=timeout)
+        with _lock:
+            result = _results.pop(cmd_id, {"error": f"Timeout - Fusion did not respond in {timeout}s"})
+            _result_events.pop(cmd_id, None)
         return result
 
     def _respond(self, code: int, body: dict):
@@ -139,6 +148,37 @@ def _find_component(root, name):
             return comp
     raise Exception(f"Component '{name}' not found.")
 
+def _find_occurrence(root, ref):
+    """Find occurrence by name or index across all nesting levels."""
+    all_occs = root.allOccurrences
+    if isinstance(ref, int) or (isinstance(ref, str) and str(ref).isdigit()):
+        idx = int(ref)
+        if idx < all_occs.count:
+            return all_occs.item(idx)
+    for i in range(all_occs.count):
+        occ = all_occs.item(i)
+        if occ.name == ref or occ.component.name == ref:
+            return occ
+    raise Exception(f"Occurrence '{ref}' not found.")
+
+def _walk_occurrences(occs):
+    """Recursively build occurrence tree."""
+    items = []
+    for i in range(occs.count):
+        occ = occs.item(i)
+        children = []
+        if occ.childOccurrences and occ.childOccurrences.count > 0:
+            children = _walk_occurrences(occ.childOccurrences)
+        items.append({
+            "name": occ.name,
+            "component": occ.component.name,
+            "visible": occ.isLightBulbOn,
+            "grounded": occ.isGrounded,
+            "bodies": occ.component.bRepBodies.count,
+            "children": children,
+        })
+    return items
+
 def _op(name):
     ops = {
         "new_body": adsk.fusion.FeatureOperations.NewBodyFeatureOperation,
@@ -184,6 +224,40 @@ def _collect_all_sketch_curves(sketch):
     return curves
 
 
+# ---- Transaction Management ----
+
+SKIP_GROUPING = {"undo", "redo", "get_info", "get_bodies_info", "get_face_info", "get_edge_info",
+                  "get_sketch_info", "get_timeline_info", "measure_body", "measure_between",
+                  "list_parameters", "list_appearances", "list_documents", "list_occurrences_tree",
+                  "get_component_info", "capture_screenshot", "fusion_status"}
+
+@contextmanager
+def _timeline_group(label="MCP Operation"):
+    """Group timeline entries created during the block into one undoable group."""
+    design = _design()
+    tl = design.timeline
+    start_pos = tl.count
+    try:
+        yield
+        end_pos = tl.count
+        if end_pos - start_pos > 1:
+            try:
+                group = tl.timelineGroups.add(start_pos, end_pos - 1)
+                group.name = label
+            except Exception:
+                pass  # grouping is best-effort
+    except Exception:
+        # Rollback: delete timeline entries created during this block
+        try:
+            current = tl.count
+            while tl.count > start_pos:
+                item = tl.item(tl.count - 1)
+                item.entity.deleteMe()
+        except Exception:
+            pass
+        raise
+
+
 # ---- Info Commands ----
 
 def _get_info(design, root):
@@ -205,7 +279,7 @@ def _get_info(design, root):
         for i in range(root.joints.count):
             j = root.joints.item(i)
             joints.append({"index": i, "name": j.name, "type": str(j.jointMotion.jointType)})
-    except:
+    except Exception:
         pass
     return {
         "document": app.activeDocument.name,
@@ -1451,16 +1525,23 @@ def _capture_screenshot(p):
 # ---- History ----
 
 def _undo(p):
+    design = _design()
+    tl = design.timeline
     count = int(p.get("steps", 1))
-    for _ in range(count):
-        app.executeTextCommand("Commands.Undo")
-    return {"undone": count}
+    actual = min(count, tl.markerPosition)
+    if actual > 0:
+        tl.markerPosition -= actual
+    return {"undone": actual, "marker_position": tl.markerPosition, "timeline_count": tl.count}
 
 def _redo(p):
+    design = _design()
+    tl = design.timeline
     count = int(p.get("steps", 1))
-    for _ in range(count):
-        app.executeTextCommand("Commands.Redo")
-    return {"redone": count}
+    available = tl.count - tl.markerPosition
+    actual = min(count, available)
+    if actual > 0:
+        tl.markerPosition += actual
+    return {"redone": actual, "marker_position": tl.markerPosition, "timeline_count": tl.count}
 
 def _save_design(p):
     doc = app.activeDocument
@@ -1483,6 +1564,74 @@ def _save_as(p):
         return {"saved_as": name}
     except Exception as e:
         return {"error": str(e)}
+
+
+# ---- Component/Occurrence Management ----
+
+def _rename_component(p):
+    name = p.get("component", "")
+    new_name = p.get("name", "")
+    if not new_name:
+        raise Exception("Parameter 'name' is required.")
+    comp = _find_component(_root(), name)
+    old = comp.name
+    comp.name = new_name
+    return {"renamed": old, "new_name": new_name}
+
+def _delete_occurrence(root, p):
+    ref = p.get("occurrence", "")
+    occ = _find_occurrence(root, ref)
+    name = occ.name
+    occ.deleteMe()
+    return {"deleted": name}
+
+def _toggle_component_visibility(root, p):
+    ref = p.get("occurrence", "")
+    occ = _find_occurrence(root, ref)
+    occ.isLightBulbOn = not occ.isLightBulbOn
+    return {"occurrence": occ.name, "visible": occ.isLightBulbOn}
+
+def _list_occurrences_tree(root):
+    return {"tree": _walk_occurrences(root.occurrences)}
+
+def _activate_component(root, p):
+    ref = p.get("component", "root")
+    design = _design()
+    if ref == "root" or ref == "":
+        design.activateRootComponent()
+        return {"activated": "root", "component": root.name}
+    # Find occurrence to activate
+    occ = _find_occurrence(root, ref)
+    occ.activate()
+    return {"activated": occ.name, "component": occ.component.name}
+
+def _get_component_info(root, p):
+    ref = p.get("component", "")
+    comp = _find_component(root, ref)
+    bodies = [{"name": comp.bRepBodies.item(i).name, "visible": comp.bRepBodies.item(i).isVisible}
+              for i in range(comp.bRepBodies.count)]
+    sketches = [{"name": comp.sketches.item(i).name, "profiles": comp.sketches.item(i).profiles.count}
+                for i in range(comp.sketches.count)]
+    children = [{"name": comp.occurrences.item(i).name, "component": comp.occurrences.item(i).component.name}
+                for i in range(comp.occurrences.count)]
+    return {"component": comp.name, "bodies": bodies, "sketches": sketches, "children": children}
+
+def _list_documents():
+    docs = []
+    active_name = app.activeDocument.name
+    for i in range(app.documents.count):
+        d = app.documents.item(i)
+        docs.append({"name": d.name, "is_active": d.name == active_name})
+    return {"documents": docs, "count": len(docs)}
+
+def _switch_document(p):
+    name = p.get("name", "")
+    for i in range(app.documents.count):
+        d = app.documents.item(i)
+        if d.name == name or name in d.name:
+            d.activate()
+            return {"activated": d.name}
+    raise Exception(f"Document '{name}' not found.")
 
 
 # ---- Dispatcher ----
@@ -1553,6 +1702,14 @@ def _process_command(data: dict) -> dict:
             "move_body_to_component":     lambda: _move_body_to_component(root, p),
             "create_joint":               lambda: _create_joint(root, p),
             "create_as_built_joint":      lambda: _create_as_built_joint(root, p),
+            "rename_component":           lambda: _rename_component(p),
+            "delete_occurrence":          lambda: _delete_occurrence(root, p),
+            "toggle_component_visibility": lambda: _toggle_component_visibility(root, p),
+            "list_occurrences_tree":      lambda: _list_occurrences_tree(root),
+            "activate_component":         lambda: _activate_component(root, p),
+            "get_component_info":         lambda: _get_component_info(root, p),
+            "list_documents":             lambda: _list_documents(),
+            "switch_document":            lambda: _switch_document(p),
             "delete_body":                lambda: _delete_body(root, p),
             "rename_body":                lambda: _rename_body(root, p),
             "copy_body":                  lambda: _copy_body(root, p),
@@ -1578,7 +1735,10 @@ def _process_command(data: dict) -> dict:
         }
 
         if cmd in dispatch:
-            return dispatch[cmd]()
+            if cmd in SKIP_GROUPING:
+                return dispatch[cmd]()
+            with _timeline_group(cmd):
+                return dispatch[cmd]()
         return {"error": f"Unknown command '{cmd}'",
                 "available_commands": sorted(dispatch.keys())}
     except Exception:
@@ -1597,11 +1757,13 @@ class MCPEventHandler(adsk.core.CustomEventHandler):
                 data = _cmd_queue.get_nowait()
                 cmd_id = data.get("id")
                 result = _process_command(data)
-                _results[cmd_id] = result
-                if cmd_id in _result_events:
-                    _result_events[cmd_id].set()
+                with _lock:
+                    _results[cmd_id] = result
+                    if cmd_id in _result_events:
+                        _result_events[cmd_id].set()
         except Exception:
-            pass
+            import traceback
+            traceback.print_exc()
 
 
 # ---- Add-in Lifecycle ----
@@ -1615,7 +1777,7 @@ def run(context):
         handler = MCPEventHandler()
         custom_event.add(handler)
         _handlers.append(handler)
-        _server = HTTPServer(("127.0.0.1", PORT), MCPRequestHandler)
+        _server = ThreadingHTTPServer(("127.0.0.1", PORT), MCPRequestHandler)
         _server_thread = threading.Thread(target=_server.serve_forever, daemon=True)
         _server_thread.start()
         ui.messageBox(
